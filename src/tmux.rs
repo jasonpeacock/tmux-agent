@@ -1,5 +1,6 @@
 //! Finding and running tmux.
 
+use std::cell::OnceCell;
 use std::env;
 use std::ffi::OsString;
 use std::io;
@@ -10,6 +11,9 @@ pub struct Tmux {
     pub bin: PathBuf,
     /// The server socket, passed to every call as `-S`.
     pub socket: String,
+    /// Whether this tmux prints `$` as `\$` in command output (3.4 only),
+    /// checked the first time output holds `\$`.
+    escapes_dollar: OnceCell<bool>,
 }
 
 impl Tmux {
@@ -21,6 +25,7 @@ impl Tmux {
         Some(Tmux {
             bin: find_tmux(server_pid)?,
             socket,
+            escapes_dollar: OnceCell::new(),
         })
     }
 
@@ -38,8 +43,25 @@ impl Tmux {
             let msg = String::from_utf8_lossy(&out.stderr).trim().to_owned();
             return Err(io::Error::other(msg));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        let out = String::from_utf8_lossy(&out.stdout).into_owned();
+        if out.contains("\\$") && *self.escapes_dollar.get_or_init(|| self.is_3_4()) {
+            return Ok(unescape_dollar(&out));
+        }
+        Ok(out)
     }
+
+    fn is_3_4(&self) -> bool {
+        Command::new(&self.bin)
+            .arg("-V")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim_end() == "tmux 3.4")
+    }
+}
+
+/// tmux 3.4 prints each `$` in a value as `\$` (3.3 and 3.5 do not). Each
+/// `$` gains exactly one backslash, so dropping it restores the value.
+fn unescape_dollar(out: &str) -> String {
+    out.replace("\\$", "$")
 }
 
 /// Builds one tmux call out of several commands.
@@ -183,6 +205,14 @@ mod tests {
         );
         assert_eq!(socket_from_env("garbage"), None);
         assert_eq!(socket_from_env(",1,2"), None);
+    }
+
+    #[test]
+    fn unescapes_tmux_3_4_dollars() {
+        assert_eq!(unescape_dollar("a\\$b"), "a$b");
+        // A stored `\$` prints as `\\$` on 3.4.
+        assert_eq!(unescape_dollar("a\\\\$b"), "a\\$b");
+        assert_eq!(unescape_dollar("no dollars"), "no dollars");
     }
 
     #[test]

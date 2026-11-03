@@ -517,7 +517,9 @@ fn odd_socket_and_binary_paths_still_run() {
     let other = s.split();
     s.set("@tmux-agent-bin", wrapper);
     s.init();
-    assert_eq!(s.opt("@agent_bin"), wrapper);
+    // tmux 3.4 prints `$` as `\$` in command output; the stored value, and so
+    // what the hooks expand, is unchanged.
+    assert_eq!(s.opt("@agent_bin").replace("\\$", "$"), wrapper);
     s.agent(&["report", "done", "--pane", &other]);
     s.attach_control();
     s.tmux(&["select-pane", "-t", &other]);
@@ -527,7 +529,11 @@ fn odd_socket_and_binary_paths_still_run() {
     assert!(read_log().lines().any(|l| l == want), "{}", read_log());
 
     // Replay the jump binding's command, as a key press would run it.
-    let key = s.key("a");
+    let mut key = s.key("a");
+    // tmux 3.4 prints `$` as `\$` in list-keys output too.
+    if s.tmux(&["display-message", "-p", "#{version}"]).trim() == "3.4" {
+        key = key.replace("\\$", "$");
+    }
     let cmd = &key[key.find("run-shell").expect(&key)..];
     let conf = s.dir.join("key.conf");
     std::fs::write(&conf, cmd).unwrap();

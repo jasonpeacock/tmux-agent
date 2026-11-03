@@ -422,6 +422,7 @@ Dependencies: `libc` and `lexopt`. `list --json` output is written by hand.
 - Always pass `-S <socket>`. Always target a pane id (`%N`) or window id (`@N`), never an index.
 - Use tab as the `-F` field separator, and reject values that contain tabs or newlines.
 - Requires tmux 3.3 or later, which `doctor` checks. `focus-events on` is required; with it off, moving between panes inside tmux never marks one seen.
+- tmux 3.4, alone among 3.3 to 3.8, prints each `$` in a value as `\$` in command output, though it stores the value unchanged. `Tmux::run` drops the added backslash when the output holds `\$` and `tmux -V` says 3.4. Ubuntu 24.04 ships 3.4.
 - Amazon Linux 2023 ships tmux 3.2a, so it needs a Nix or Homebrew tmux.
 
 ## Testing
