@@ -337,17 +337,25 @@ pub fn summary_text(snap: &Snapshot) -> String {
     for p in &snap.panes {
         s.add(display_of(&p.rec));
     }
-    let icons = &snap.config.icons;
-    [
-        (s.needs_input, &icons[0]),
-        (s.done, &icons[1]),
-        (s.working, &icons[2]),
-    ]
-    .iter()
-    .filter(|(n, _)| *n > 0)
-    .map(|(n, icon)| format!("{icon} {n}"))
-    .collect::<Vec<_>>()
-    .join(" ")
+    let cfg = &snap.config;
+    let counts = [s.needs_input, s.done, s.working];
+    let parts: Vec<String> = (0..3)
+        .filter(|&i| counts[i] > 0)
+        .map(|i| {
+            if cfg.summary_dots {
+                // `default` restores the style in force where the summary is
+                // drawn, which push-default saved below.
+                format!("#[fg={}]\u{25cf}#[default] {}", cfg.colors[i], counts[i])
+            } else {
+                format!("{} {}", cfg.icons[i], counts[i])
+            }
+        })
+        .collect();
+    if cfg.summary_dots && !parts.is_empty() {
+        format!("#[push-default]{}#[pop-default]", parts.join(" "))
+    } else {
+        parts.join(" ")
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +371,7 @@ mod tests {
             pane_border: true,
             icons: ["N".into(), "D".into(), "W".into()],
             colors: ["red".into(), "green".into(), "yellow".into()],
+            summary_dots: false,
         }
     }
 
@@ -612,6 +621,20 @@ mod tests {
             "{args}"
         );
         assert!(args.ends_with("set-option -g @agent_summary "), "{args}");
+    }
+
+    #[test]
+    fn summary_dots_colour_each_count() {
+        let mut s = snap(vec![pane("%1", "@1"), pane("%2", "@1"), pane("%3", "@2")]);
+        s.config.summary_dots = true;
+        assert_eq!(summary_text(&s), "", "nothing shows when no agent does");
+        apply_report(&mut s, &report("ask", "%1", me()));
+        apply_report(&mut s, &report("working", "%2", me()));
+        apply_report(&mut s, &report("working", "%3", me()));
+        assert_eq!(
+            summary_text(&s),
+            "#[push-default]#[fg=red]\u{25cf}#[default] 1 #[fg=yellow]\u{25cf}#[default] 2#[pop-default]"
+        );
     }
 
     #[test]

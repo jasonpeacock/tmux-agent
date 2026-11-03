@@ -259,7 +259,7 @@ Each pane with a state other than idle gets a per-pane `pane-border-style` and `
 
 ### Status-right summary
 
-`@agent_summary` counts agent panes by displayed state across the server, e.g. `󰂞 1  2  3`. It deduplicates by `#{pane_id}` over `list-panes -a`, because grouped sessions list the same panes more than once. Idle agents are not counted.
+`@agent_summary` counts agent panes by displayed state across the server, e.g. `󰂞 1  2  3`. It deduplicates by `#{pane_id}` over `list-panes -a`, because grouped sessions list the same panes more than once. Idle agents are not counted. With `@tmux-agent-summary-style dots`, each count gets a `●` in its state's colour instead of the icon, written as `#[push-default]#[fg=<colour>]●#[default] N … #[pop-default]` so the surrounding style comes back after each dot (tmux 3.3+).
 
 Put this in your main tmux config, after your own `status-right` and before continuum's `run-shell`:
 
@@ -358,6 +358,7 @@ All options are tmux user options, read in one call. The Home Manager module wri
 | `@tmux-agent-icon-<state>`, `@tmux-agent-color-<state>` | see Icons and colours |
 | `@tmux-agent-jump-key`, `@tmux-agent-pick-key` | `a`, `A` |
 | `@tmux-agent-choose-tree` | `on` |
+| `@tmux-agent-summary-style` | `icons`; `dots` shows a dot in each state's colour instead |
 
 ## Install
 

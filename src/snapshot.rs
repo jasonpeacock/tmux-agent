@@ -14,6 +14,9 @@ pub struct Config {
     /// Icons and colours: needs-input, done, working.
     pub icons: [String; 3],
     pub colors: [String; 3],
+    /// `@tmux-agent-summary-style dots`: a dot in each state's colour in the
+    /// summary, in place of the icons.
+    pub summary_dots: bool,
 }
 
 /// Server-wide values.
@@ -80,7 +83,7 @@ const G_FMT: &str = concat!(
     "\t#{@tmux-agent-bin}\t#{@tmux-agent-tab-mode}\t#{@tmux-agent-pane-border}",
     "\t#{@tmux-agent-icon-needs-input}\t#{@tmux-agent-icon-done}\t#{@tmux-agent-icon-working}",
     "\t#{E:@tmux-agent-color-needs-input}\t#{E:@tmux-agent-color-done}\t#{E:@tmux-agent-color-working}",
-    "\t#{version}\t#{@agent_summary}",
+    "\t#{version}\t#{@agent_summary}\t#{@tmux-agent-summary-style}",
 );
 const C_FMT: &str =
     "\t#{client_name}\t#{pane_id}\t#{client_flags}\t#{client_height}\t#{client_width}";
@@ -212,7 +215,7 @@ fn or_default(v: &str, d: &str) -> String {
 }
 
 fn parse_global(rest: &str) -> (Config, Global) {
-    let f: Vec<&str> = rest.splitn(11, '\t').collect();
+    let f: Vec<&str> = rest.splitn(12, '\t').collect();
     let get = |i: usize| f.get(i).copied().unwrap_or("");
     let config = Config {
         bin: get(0).to_owned(),
@@ -220,6 +223,7 @@ fn parse_global(rest: &str) -> (Config, Global) {
         pane_border: get(2) != "off",
         icons: [0, 1, 2].map(|i| or_default(get(3 + i), DEFAULT_ICONS[i])),
         colors: [0, 1, 2].map(|i| or_default(get(6 + i), DEFAULT_COLORS[i])),
+        summary_dots: get(11) == "dots",
     };
     let global = Global {
         version: get(9).to_owned(),
@@ -289,7 +293,7 @@ mod tests {
     use super::*;
 
     const OUT: &str = "\
-Gt\t/bin/ta\t\toff\t\t\tW\t#ff0000\t\t\t3.8\tS
+Gt\t/bin/ta\t\toff\t\t\tW\t#ff0000\t\t\t3.8\tS\tdots
 Gt\tignored
 Ct\t/dev/ttys001\t%1\tattached,focused,UTF-8\t50\t120
 Ct\t/dev/ttys002\t%2\tattached\t40\t80
@@ -322,6 +326,7 @@ underscore
         assert_eq!(s.config.colors[1], DEFAULT_COLORS[1]);
         assert_eq!(s.global.version, "3.8");
         assert_eq!(s.global.summary, "S");
+        assert!(s.config.summary_dots);
         assert_eq!(s.global.status_style, "default");
         assert_eq!(s.global.status_current_style, "underscore");
 

@@ -1316,6 +1316,7 @@ mod tests {
                 pane_border: true,
                 icons: Default::default(),
                 colors: Default::default(),
+                summary_dots: false,
             },
             global: Global::default(),
             clients: Vec::new(),

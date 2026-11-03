@@ -115,6 +115,18 @@ in
       };
     };
 
+    summaryStyle = lib.mkOption {
+      type = lib.types.enum [
+        "icons"
+        "dots"
+      ];
+      default = "icons";
+      description = ''
+        How `@agent_summary` marks each count: the state icons, or a dot in
+        each state's colour.
+      '';
+    };
+
     chooseTree = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -163,6 +175,7 @@ in
             (setOpt "jump-key" cfg.keys.jump)
             (setOpt "pick-key" cfg.keys.pick)
             (setOpt "choose-tree" (onOff cfg.chooseTree))
+            (setOpt "summary-style" cfg.summaryStyle)
           ]
           ++ lib.concatLists (
             lib.mapAttrsToList (state: v: [
