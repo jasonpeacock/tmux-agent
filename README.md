@@ -1,5 +1,7 @@
 # tmux-agent
 
+[![ci](https://github.com/jasonpeacock/tmux-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/jasonpeacock/tmux-agent/actions/workflows/ci.yml)
+
 Shows the status of Claude Code agents on tmux window tabs, so you can see which windows need you. Each tab is recoloured, and gets an icon, by the most urgent agent in any of its panes:
 
 **needs input > done (not yet seen) > working > idle**
@@ -20,7 +22,7 @@ Idle shows nothing. A pane counts as seen once you focus it.
 ```nix
 # flake.nix inputs
 tmux-agent = {
-  url = "github:<owner>/tmux-agent";
+  url = "github:jasonpeacock/tmux-agent";
   inputs.nixpkgs.follows = "nixpkgs";
 };
 
@@ -35,7 +37,7 @@ tmux-agent.homeModules.default
 ### Manual
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/jasonpeacock/tmux-agent
 ```
 
 Then add this to `tmux.conf`, after any `set-hook` lines of your own:
@@ -47,7 +49,13 @@ run-shell "tmux-agent init"
 Install the Claude plugin from a Claude Code session:
 
 ```
-/plugin install tmux-agent --marketplace <owner>/tmux-agent
+/plugin install tmux-agent --marketplace jasonpeacock/tmux-agent
+```
+
+Or from a shell:
+
+```sh
+claude plugin install tmux-agent --marketplace jasonpeacock/tmux-agent
 ```
 
 ### Theme integration
@@ -70,6 +78,8 @@ set -ag status-right "#{@agent_summary}#(#{@agent_bin} reconcile)"
 ## Development
 
 ```sh
+git clone https://github.com/jasonpeacock/tmux-agent
+cd tmux-agent
 nix develop   # or use your own Rust toolchain and tmux >= 3.3
 cargo test
 claude plugin validate plugin

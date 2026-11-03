@@ -383,8 +383,8 @@ The catppuccin and status-right snippets stay in the user's own config, because 
 ### Claude plugin without Nix
 
 `.claude-plugin/marketplace.json` at the repo root lists `plugin/`.
-1. Add the marketplace: `/plugin marketplace add ~/workplace/tmux-agent` before the repo is pushed, or `/plugin marketplace add <owner>/tmux-agent` after.
-2. Install: `/plugin install tmux-agent --marketplace <owner>/tmux-agent`.
+1. Install: `/plugin install tmux-agent --marketplace jasonpeacock/tmux-agent`. This adds the marketplace from GitHub on first use.
+2. For development, a local checkout works as the marketplace: `/plugin marketplace add <path to checkout>`.
 
 ## Repository layout
 
