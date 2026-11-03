@@ -121,15 +121,21 @@ in
       description = "Rebind `prefix w` to a choose-tree that shows agent icons.";
     };
 
-    claudePlugin.enable = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = ''
-        Install the Claude Code plugin through
-        `programs.claude-code.plugins`. Requires `programs.claude-code.enable`;
-        `programs.claude-code.package = null` works with a Claude installed
-        outside Nix.
-      '';
+    claudePlugin = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Install the Claude Code plugin as a personal plugin, linked into
+          `<configDir>/skills/tmux-agent`. Works with any Claude Code install
+          (2.1.157 or later), Nix or not.
+        '';
+      };
+      configDir = lib.mkOption {
+        type = lib.types.str;
+        default = ".claude";
+        description = "Claude Code's config directory, relative to the home directory.";
+      };
     };
 
     statusRightSnippet = lib.mkOption {
@@ -168,8 +174,11 @@ in
       }
     ];
 
-    programs.claude-code.plugins = lib.mkIf cfg.claudePlugin.enable {
-      tmux-agent = claudePlugin;
+    # One symlink to the plugin's store path. Claude Code refuses a hooks
+    # module whose real path lies outside the plugin's, so the plugin must not
+    # be a tree of per-entry links, as programs.claude-code.plugins makes it.
+    home.file."${cfg.claudePlugin.configDir}/skills/tmux-agent" = lib.mkIf cfg.claudePlugin.enable {
+      source = claudePlugin;
     };
   };
 }

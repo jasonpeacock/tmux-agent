@@ -371,7 +371,7 @@ Packages:
 Other outputs: `overlays.default`, and `homeModules.default` (aliased as `homeManagerModules.default`). The module provides:
 - `programs.tmux-agent.enable` adds the tmux plugin to `programs.tmux.plugins`, writes the `@tmux-agent-*` options in that entry's `extraConfig`, and puts the binary in `home.packages`.
 - Options for icons, colours, keys, tab mode and border.
-- `programs.tmux-agent.claudePlugin.enable` sets `programs.claude-code.plugins.tmux-agent`. This works with `package = null` for the ASBX Claude.
+- `programs.tmux-agent.claudePlugin.enable` links the plugin package into `~/.claude/skills/tmux-agent` (`claudePlugin.configDir` changes `.claude`) as a single symlink, and Claude loads it as a personal plugin. Not `programs.claude-code.plugins`: that wraps each top-level entry in its own symlink, and Claude refuses a hooks module whose real path is outside the plugin directory (verified on 2.1.316).
 - The read-only `statusRightSnippet`.
 
 The catppuccin and status-right snippets stay in the user's own config, because their placement relative to catppuccin and continuum is the user's.

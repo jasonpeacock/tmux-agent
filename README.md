@@ -30,7 +30,7 @@ tmux-agent = {
 tmux-agent.homeModules.default
 {
   programs.tmux-agent.enable = true;
-  programs.tmux-agent.claudePlugin.enable = true; # needs programs.claude-code.enable
+  programs.tmux-agent.claudePlugin.enable = true; # links it into ~/.claude/skills
 }
 ```
 
