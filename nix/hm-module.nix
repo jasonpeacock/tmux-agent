@@ -47,11 +47,11 @@ let
       color = "#f38ba8";
     };
     done = {
-      icon = "";
+      icon = "";
       color = "#a6e3a1";
     };
     working = {
-      icon = "";
+      icon = "";
       color = "#f9e2af";
     };
   };

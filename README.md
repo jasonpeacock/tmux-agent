@@ -6,7 +6,7 @@ Shows the status of Claude Code agents on tmux window tabs, so you can see which
 
 Idle shows nothing. A pane counts as seen once you focus it.
 
-> Status: early development. The state logic and packaging exist; the commands are stubs. See [docs/design.md](docs/design.md).
+> Status: early development. Everything in the design is implemented and tested on macOS with tmux 3.8 and 3.3a, and against a live Claude Code 2.1.316 session; Linux is untested so far. Known limits are in [docs/design.md](docs/design.md).
 
 ## How it works
 

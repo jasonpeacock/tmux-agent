@@ -162,7 +162,7 @@ These rules follow from the events Claude sends:
 - `idle_prompt` is not in the Notification allowlist. It fires about 60 seconds after a turn ends and would turn `done` into `needs-input`.
 - `PermissionDenied` is an auto-mode denial. It closes the matching ask.
 
-**Known gap:** an approved tool that runs longer than the grace delay shows red until it ends, because `PostToolUse` is the first event after approval. V-1 checks for an earlier signal.
+**Known gap:** an approved tool that runs longer than the grace delay shows red until it ends, because `PostToolUse` is the first event after approval. Verified live: `tool.check` resolves `ask` and the `PermissionRequest` chain resolves within milliseconds, before the person answers, and `turn.step` streams only the model's response. No hook marks the approval itself.
 
 ### Background work
 
@@ -198,7 +198,7 @@ All state lives in tmux options, so it dies with the pane, the window or the ser
 | window | `@agent_window_state` | rolled-up state |
 | window | `@agent_tab_color` | literal colour for the rolled-up state, or unset |
 | window | `@agent_tab_icon` | icon plus a trailing space, or unset |
-| global | `@agent_summary` | e.g. `󰂞 1  2  3`, or empty |
+| global | `@agent_summary` | e.g. `󰂞 1  2  3`, or empty |
 | global | `@agent_bin`, `@agent_version` | the binary path that hooks run, and its version |
 
 ### Writes and races
@@ -259,7 +259,7 @@ Each pane with a state other than idle gets a per-pane `pane-border-style` and `
 
 ### Status-right summary
 
-`@agent_summary` counts agent panes by displayed state across the server, e.g. `󰂞 1  2  3`. It deduplicates by `#{pane_id}` over `list-panes -a`, because grouped sessions list the same panes more than once. Idle agents are not counted.
+`@agent_summary` counts agent panes by displayed state across the server, e.g. `󰂞 1  2  3`. It deduplicates by `#{pane_id}` over `list-panes -a`, because grouped sessions list the same panes more than once. Idle agents are not counted.
 
 Put this in your main tmux config, after your own `status-right` and before continuum's `run-shell`:
 
@@ -284,9 +284,9 @@ The Home Manager module exports the plain form as the read-only option `programs
 
 | State | Options (icon, colour) | Default icon | Default colour |
 |---|---|---|---|
-| needs-input | `@tmux-agent-icon-needs-input`, `@tmux-agent-color-needs-input` | `󰂞` | `#f38ba8` |
-| done | `@tmux-agent-icon-done`, `@tmux-agent-color-done` | `` | `#a6e3a1` |
-| working | `@tmux-agent-icon-working`, `@tmux-agent-color-working` | `` | `#f9e2af` |
+| needs-input | `@tmux-agent-icon-needs-input`, `@tmux-agent-color-needs-input` | `󰂞` (U+F009E) | `#f38ba8` |
+| done | `@tmux-agent-icon-done`, `@tmux-agent-color-done` | `` (U+F058) | `#a6e3a1` |
+| working | `@tmux-agent-icon-working`, `@tmux-agent-color-working` | `` (U+F110) | `#f9e2af` |
 
 A colour may be a format such as `#{@thm_red}`. The binary expands it once, with `#{E:@tmux-agent-color-<state>}` in the same call that reads the config. It publishes the literal colour, so neither mode expands formats twice.
 
@@ -296,16 +296,20 @@ A colour may be a format such as `#{@thm_red}`. The binary expands it once, with
 |---|---|---|
 | `prefix a` | `@tmux-agent-jump-key` | Jump to the most urgent agent pane on the server: needs-input first, then unseen done, oldest `since` first. Pressing it again cycles to the next one after the current pane. |
 | `prefix A` | `@tmux-agent-pick-key` | A `display-menu` of agent panes, sorted by urgency (details below). |
-| `prefix w` | `@tmux-agent-choose-tree` (`on` or `off`) | `choose-tree -Zw` with a `-F` copied from tmux's default plus `#{@agent_tab_icon}` on window rows only. `off` leaves the user's binding alone. |
+| `prefix w` | `@tmux-agent-choose-tree` (`on` or `off`) | `choose-tree -Zw` with a `-F` copied from the server version's default (3.3, 3.7 or 3.8 and later, by `#{version}`) plus `#{@agent_tab_icon}` on window rows only. `off` restores tmux's own binding if the current one is ours, and otherwise leaves it alone. |
 
 The picker:
 - Each item shows the icon, `session:window.pane`, the window name, the cwd and the time in state.
 - Items are capped at `client_height - 2`. A final "… N more" item opens `choose-tree`.
-- `#` is escaped as `##` in every field.
+- `#` in user text is escaped for the menu's two format passes: each run of n `#` becomes 2n before `[` and 4n otherwise. Item commands use plain `##`.
 - Items 1–9 and 0 get mnemonic keys.
 
 Keys:
-- Bindings use `bind-key -N 'tmux-agent: <action>'`. Ownership is detected through `list-keys -T prefix -F '#{key_string}\t#{key_note}'`.
+- Bindings use `bind-key -N 'tmux-agent: <action>'`. `list-keys -F` exists only from tmux 3.7 (V-4), so ownership comes from `list-keys -N`, which lists only keys with a note:
+  - Each wanted key gets its own `list-keys -N -T prefix -- <key>` call. tmux parses the spelling, so `space` and `M-C-a` find `Space` and `C-M-a`. If that call fails, `list-keys -T prefix -- <key>` tells a binding without a note from "unknown key" (free); "invalid key" means a bad option, and the key is skipped.
+  - Our bindings come from `list-keys -N -T prefix`, without `-a`. With `-a`, tmux 3.3 pads only keys that have a note, so a key without one runs into its command.
+  - The comparison uses the key as tmux prints it, never the option text. A missing prefix table (after `unbind -a`) counts as empty.
+  - Each `bind-key` and `unbind-key` is a call of its own, with `--` before the key and a final `;` passed as `\;`. A bad key option fails only its own key.
 - A key is bound only when it is free or already owned by tmux-agent. Otherwise `init` leaves the existing binding, and `doctor` reports the conflict.
 - `prefix w` is the exception, controlled by its own option.
 - Every binding passes `#{client_name}`, so the jump moves the client that pressed the key.
@@ -314,7 +318,7 @@ Keys:
 
 | Command | Called by | Purpose |
 |---|---|---|
-| `init` | `tmux-agent.tmux` (`run-shell`) | Set `focus-events on`. Read the config, register the tmux hooks at a fixed index, bind keys, publish `@agent_bin` and `@agent_version`, then `reconcile`. Idempotent on re-source. |
+| `init` | `tmux-agent.tmux` (`run-shell`) | Read the config in one call. In a second, set `focus-events on`, register the tmux hooks at a fixed index and publish `@agent_bin` and `@agent_version`. Then bind each key in its own call, then `reconcile`. A key failure does not skip `reconcile`. `reconcile` is skipped when no session exists, as while tmux.conf first loads. Idempotent on re-source. |
 | `report <event>` | Claude plugin | Events: `claim`, `reset`, `working`, `ask`, `resume`, `done`, `error`, `cancel`, `release`. Flags: `--proto`, `--pane`, `--socket`, `--pid`, `--session`, `--bg`, `--plugin-version`. |
 | `focus --pane` | the `pane-focus-in` hook | Apply `focus`, then `reconcile`. |
 | `reconcile` | hooks, status token, navigation | Clear dead state and recompute rollups and the summary. Prints nothing. |
@@ -335,8 +339,10 @@ Every command except `doctor` and `list` exits 0 on tmux errors, so a missing se
 Hooks are written as:
 
 ```tmux
-run-shell -b 'b="#{@agent_bin}"; [ -x "$b" ] && "$b" focus --pane #{hook_pane} --socket #{socket_path}; true'
+run-shell -b 'b=#{q:@agent_bin}; [ -x "$b" ] && "$b" focus --pane #{hook_pane} --socket '"'"'/abs/socket'"'"'; true'
 ```
+
+`#{q:}` shell-quotes the binary path, so spaces, quotes, `#` and `$` survive. The socket is written as a literal: `init` makes it absolute (`#{socket_path}` keeps a relative `-S`, and hooks run in a pane's directory), shell-quotes it and doubles `#` for run-shell's format expansion. In the hook string, each `'` is closed as `'"'"'` for tmux's parser. Key bindings use the same command without that last layer. A bare `@tmux-agent-bin` name is looked up in `PATH` at init.
 
 They pass `#{hook_pane}`. `$TMUX_PANE` is unset in `run-shell`, and `#{pane_id}` names the wrong pane. `run-shell tmux-agent init` must come after the user's own `set-hook` lines, because an unindexed `set-hook` replaces the whole hook array.
 
@@ -460,15 +466,17 @@ Dependencies: `libc` and `lexopt`. `list --json` output is written by hand.
 - **Style mode:** per-window `window-status-style` expands `#{@thm_red}`.
 - **catppuccin:** recolours through `@agent_tab_color` (snippet above).
 - **Linux desktop:** runs the same Claude build as the laptop, 2.1.316.1544, so it has the same plugin API.
+- **Live session** (Claude 2.1.316, tmux 3.8, private server): claim records the Claude PID; a Bash permission prompt shows `needs-input` after the grace delay; approval goes to `working`, then `done` at the turn's end; Ctrl-C mid-turn goes to `idle`; `/exit` and quitting release the pane, its borders and the summary; `--plugin-dir` hot-reloads the plugin mid-session, and the reload's claim keeps the state.
+- **No approval signal** (was V-1): order of events for an approved Bash call: `tool.call` start, `tool.check` → `ask` (15 ms), `classic.PermissionRequest` (its `next` resolves at once), then nothing until `classic.PostToolUse` when the tool ends.
+- **Do not run processes from `tool.check` or `tool.call` hooks:** a `$.process.run` awaited inside them stalled the turn.
 
 ## To verify
 
 | # | Question | Why it matters |
 |---|---|---|
-| V-1 | Does any event fire between a permission approval and the tool's run, for example the `tool.call` or `tool.check` ordering? | Decides whether red clears on approval or only when the tool ends. |
 | V-2 | Which events fire when the user rejects a dialog with "No, and tell Claude…"? | The ask must close. |
 | V-3 | Does a finished background subagent wake the main thread? | If yes, drop the agent-turn fallback. |
-| V-4 | Does `list-keys -F` with `#{key_note}` work on tmux 3.3? | Key ownership detection, or a higher tmux floor. |
+| V-4 | Answered: no. `list-keys -F` arrived in tmux 3.7; 3.3a's `list-keys` takes only `-1aNP:T:`. Ownership uses `list-keys -N` (see Navigation). | Key ownership detection, or a higher tmux floor. |
 | V-5 | Can public npm `@anthropic-ai/claude-code` run `plugin validate` and `plugin test` in CI with no login? | The plugin CI job. |
 | V-6 | Does `pane-focus-in` fire over SSH from WezTerm? | Seen on terminal focus. |
-| V-8 | Do `PermissionRequest` and `Notification` reach the mod live? Only the types confirm it so far. | Asks. |
+| V-8 | Does `Notification` (elicitation types) reach the mod live? `PermissionRequest` does (Verified). | Elicitation asks. |
