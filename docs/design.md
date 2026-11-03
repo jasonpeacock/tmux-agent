@@ -1,0 +1,474 @@
+# tmux-agent design
+
+Show the status of Claude Code agents on tmux window tabs, so you can see at a glance which windows need you.
+
+Prior art and the reasoning behind many choices below: [research.md](research.md).
+
+## Goals
+
+- Recolour each window tab, and add an icon, by the most urgent agent state of any pane in that window.
+- Priority: **needs-input > done (unseen) > working > idle**. Idle shows nothing.
+- Run on macOS and Linux, with tmux on a remote host reached over SSH.
+- Never rewrite the user's theme formats. Publish tmux options that the theme reads.
+- Cost no forks per status refresh for the tab state.
+
+## Non-goals
+
+- Desktop notifications, sounds and terminal bells. tmux runs remotely, so none of these would reach the user.
+- Agents other than Claude Code.
+- Agents with no tmux pane: other terminals, IDEs, the desktop app, and `claude -p` scripts.
+- TPM install.
+
+## States
+
+| State | Meaning | Tab | Rank |
+|---|---|---|---|
+| `needs-input` | A permission prompt, a question, plan approval or an elicitation dialog is open, or the turn ended on an API error | red, icon | 3 |
+| `done` | The turn finished, no background work remains, and the user has not focused the pane since | green, icon | 2 |
+| `working` | A turn is running, or background work the session owns is still running | yellow, icon | 1 |
+| `idle` | Seen done, seen error, cancelled, or a session with no prompt yet | theme default, no icon | 0 |
+| (none) | No agent in the pane | theme default | – |
+
+A window shows the state of its highest-ranked pane. All panes count, including panes hidden by a zoom.
+
+### Seen
+
+**Seen** means tmux fired `pane-focus-in` for the pane. With `focus-events on`, that hook fires on `select-pane`, `select-window`, `switch-client`, attach, and when the terminal regains focus. Focusing a `done` or error `needs-input` pane turns it `idle`. Focusing a pane with an open prompt changes nothing, because the prompt still needs an answer.
+
+A `done` that arrives while its pane is already focused goes straight to `idle`. "Focused" means some row of `list-clients -F '#{pane_id}\t#{client_flags}'` has that pane and its flags contain `focused`. `session_attached`, `window_active` and `pane_active` are not used: they are true for sessions that nobody is looking at.
+
+### Transitions
+
+The binary keeps two facts per pane:
+- the **loop** state: `idle`, `working`, `done` or `error`;
+- an **asks** flag, true while the plugin reports at least one open prompt.
+
+The displayed state is `needs-input` if asks is set or the loop is `error`. Otherwise it is the loop state.
+
+| Event | Loop after | Asks after | Notes |
+|---|---|---|---|
+| `claim`, pane unowned or owner dead | `idle` | off | takes ownership; bg = 0 |
+| `claim`, same owner | unchanged | unchanged | Sent again on a plugin reload or worker respawn, which can happen mid-turn. Refreshes the owner fields only. |
+| `reset` | `idle` | off | `/clear` or an in-process resume; bg = 0 |
+| `working` | `working` | unchanged | bg = 0 |
+| `ask` | unchanged | on | |
+| `resume` | `working` if `done` or `idle`, else unchanged | off | |
+| `done --bg N`, N > 0 | `working` | unchanged | stores bg = N |
+| `done`, bg 0, pane focused | `idle` | unchanged | |
+| `done`, bg 0 | `done` | unchanged | Shows `needs-input` while asks is on. |
+| `error` | `error` | unchanged | |
+| `cancel` | `idle` | off | Esc: the user is at the pane |
+| `focus` | `done` → `idle`, `error` → `idle`, else unchanged | unchanged | |
+| `release` | cleared | cleared | Clears all `@agent_pane_*` options |
+
+Reports from a pane's non-owner are dropped (see Ownership). The unit tests enumerate this table.
+
+## Architecture
+
+```mermaid
+flowchart TB
+  subgraph Claude["Claude Code process (one per pane)"]
+    Mod["tmux-agent Claude plugin<br/>(mod: hooks/register.ts)"]
+  end
+  subgraph Bin["tmux-agent binary (Rust)"]
+    Report["report"]
+    Focus["focus / reconcile"]
+    Nav["jump / pick / list / doctor"]
+    Init["init"]
+  end
+  subgraph Tmux["tmux server"]
+    PaneOpts["pane options<br/>@agent_pane_*"]
+    WinOpts["window options<br/>@agent_tab_color, @agent_tab_icon"]
+    GlobOpts["global option<br/>@agent_summary"]
+    Theme["window-status-format<br/>status-right (user's theme)"]
+    Hooks["tmux hooks<br/>pane-focus-in, pane-exited, ..."]
+  end
+  Mod -- "$.process.run: tmux-agent report EVENT (serialized)" --> Report
+  Report -- "lock, transition, roll up" --> PaneOpts
+  Report --> WinOpts
+  Report --> GlobOpts
+  Hooks -- "run-shell -b" --> Focus
+  Focus --> PaneOpts
+  Theme -. "reads at render, 0 forks" .-> WinOpts
+  Theme -.-> GlobOpts
+  Init -- "set-hook, bind-key (idempotent)" --> Hooks
+```
+
+There are two parts:
+
+1. **The Claude plugin** (`plugin/`, TypeScript). It is a mod: it hooks Claude Code's in-process plugin API, tracks open prompts and background work, and sends a small vocabulary of reports to the binary. The transitions and everything tmux-related stay in Rust, where they are testable.
+2. **The `tmux-agent` binary** (Rust). It owns ownership checks, transitions, the window rollup, focus handling, cleanup, navigation and tmux setup.
+
+### Why the plugin API and not `settings.json` hooks
+
+- `turn.complete` carries `reason` (`answer`, `refusal`, `aborted`, `error`) and `isAborted`. An Esc cancel is detected, including Esc during a Bash call, where neither `Stop` nor `PostToolUse` fires.
+- `classic.<Event>` hooks deliver the same payloads as `settings.json` hooks (`PermissionRequest`, `Notification`, `PreToolUse`, `Stop`, ...) without editing `settings.json`.
+- `classic.Stop` carries `background_tasks`. Each entry has a type of `shell`, `subagent`, `workflow`, `monitor` or `session_crons`, which counts background Bash too. `$.agent.list()` does not include background Bash.
+- `session.start` exposes `surface` and `isInteractive`, so `claude -p` and non-terminal surfaces are skipped at the source.
+- `session.end` carries a reason, so `/clear` and resume can be told apart from exit.
+
+## The Claude plugin
+
+### Activation
+
+The plugin acts only when `session.start` reports `surface === 'terminal'` and `isInteractive`, and `$.env.get('TMUX')` and `$.env.get('TMUX_PANE')` are both set. Otherwise every hook only calls `next(e)`.
+
+### Hook discipline
+
+- Each event gets its own literal `on('<event>', ...)`. The handlers call shared plain helpers.
+- Every hook calls `next(e)` without waiting for tmux, and each classic hook has a `.catch` that falls through to `next(e)`.
+- Reports go through one promise chain: `q = q.then(() => $.process.run(argv, { timeoutMs })).catch(() => {})`. This gives a total order per Claude process. No hook awaits the chain, except `session.end`, which awaits its final report within the hook's remaining budget.
+- Every report passes `--proto 1`. The binary ignores unknown events and flags and exits 0, so a newer plugin with an older binary degrades quietly.
+
+### Identity
+
+- **Pane and socket**: `TMUX_PANE`, and the socket path parsed from `TMUX`, passed as `--pane` and `--socket`.
+- **Owner PID**: `$.process.run(['sh', '-c', 'echo $PPID'])` at `session.start`. This returns the Claude engine process, verified on 2.1.316. It is not `#{pane_pid}` and not the ASBX wrapper.
+- **Session id**: `$.session.id()`, read at each report, because it changes on `/clear`. It is used for display only.
+
+### Event mapping
+
+| Plugin event | Condition | Action |
+|---|---|---|
+| `session.start` | active (see Activation) | report `claim --pid P` |
+| `turn.start` | main thread (no `agentId`) | clear asks for the main thread; bg = 0; report `working` |
+| `classic.PermissionRequest` | any agent, including subagents | open an ask keyed by `(agent_id ?? main, tool_name, hash(tool_input))` |
+| `classic.PreToolUse` | tool `AskUserQuestion` or `ExitPlanMode` | open an ask keyed by `(*, tool, hash(input))`. The envelope carries no agent_id, so it matches any agent. |
+| `classic.Notification` | `elicitation_dialog`, `elicitation_url_dialog`, `agent_needs_input`, `worker_permission_prompt` | open an ask keyed by `(agent_id ?? main, notification_type)` |
+| `classic.Notification` | `permission_prompt` | confirm an existing ask only; never open one |
+| `classic.PostToolUse`, `PostToolUseFailure`, `PermissionDenied` | | close the matching ask |
+| `classic.ElicitationResult`, Notification `elicitation_complete` or `elicitation_response` | | close that agent's elicitation ask |
+| `classic.UserPromptSubmit` | | close all asks |
+| `turn.start` / `turn.complete` | an agent with `agentId` | close that agent's asks |
+| `classic.Stop` | main thread (`agent_id` undefined) | bg = count of `background_tasks` with type `shell`, `subagent` or `workflow` |
+| `turn.complete` | main, reason `aborted` | close all asks; report `cancel` |
+| `turn.complete` | main, reason `error` | report `error` |
+| `turn.complete` | main, reason `answer` or `refusal` | report `done --bg N` |
+| `turn.complete` | a background agent's turn (fallback) | Only for agentIds seen in `$.agent.list()`. After 250 ms, if the main thread is not running and no listed agent is `pending`, `running` or `waiting` (teammates excluded), report `done`. |
+| `session.end` | reason `clear` or `resume` | report `reset` |
+| `session.end` | any other reason | report `release`, awaited |
+
+`monitor` and `session_crons` background tasks are not counted, because they are long-lived and would pin the pane on `working`.
+
+### Asks and the grace delay
+
+- Each ask has its own `$.clock.after(graceMs)` timer; the default is 1000 ms.
+- When the first ask's timer fires and the set is still non-empty, the plugin reports `ask`.
+- When the set becomes empty after `ask` was reported, the plugin reports `resume`.
+- Dialogs answered within the grace delay never show.
+
+These rules follow from the events Claude sends:
+- Auto-mode classifier decisions never raise `PermissionRequest`, so they never show.
+- `idle_prompt` is not in the Notification allowlist. It fires about 60 seconds after a turn ends and would turn `done` into `needs-input`.
+- `PermissionDenied` is an auto-mode denial. It closes the matching ask.
+
+**Known gap:** an approved tool that runs longer than the grace delay shows red until it ends, because `PostToolUse` is the first event after approval. V-1 checks for an earlier signal.
+
+### Background work
+
+| Kind | Handling |
+|---|---|
+| Foreground subagents (Task tool) | Roll into the parent pane. Their prompts open asks. Their turn ends only close their own asks. |
+| Background subagents, workflows, background Bash | Counted from `Stop.background_tasks`. The main turn's end then shows `working`. When the work finishes, Claude wakes the main thread, verified for Bash, and that turn's end reports `done`. The agent-turn fallback covers the case where no wake happens. |
+| `claude -p` in a pane | Ignored: `isInteractive` is false. |
+| A nested interactive `claude` in a pane already owned | Its `claim` is refused while the owner lives (see Ownership). |
+| Agents outside tmux | Out of scope. |
+
+### Settings
+
+Plugin `userConfig`:
+- `binary`: the default is `tmux-agent` on PATH. The Nix-built plugin substitutes an absolute path.
+- `graceMs`: the default is 1000.
+
+## The binary
+
+### State storage
+
+All state lives in tmux options, so it dies with the pane, the window or the server. tmux-resurrect and continuum do not restore `@` options. Pane and window options use different names, because a pane option with no value falls back to the window option of the same name.
+
+| Scope | Option | Value |
+|---|---|---|
+| pane | `@agent_pane_state` | displayed state: `needs-input`, `done`, `working`, `idle` |
+| pane | `@agent_pane_loop`, `@agent_pane_asks` | `idle`/`working`/`done`/`error`, and `0`/`1` |
+| pane | `@agent_pane_pid`, `@agent_pane_pid_start` | owner PID and its process start time |
+| pane | `@agent_pane_session` | Claude session id, for display |
+| pane | `@agent_pane_since` | epoch seconds of the last change to the displayed state |
+| pane | `@agent_pane_bg` | background work count |
+| pane | `@agent_pane_proto`, `@agent_pane_plugin` | protocol and plugin version, for `doctor` |
+| window | `@agent_window_state` | rolled-up state |
+| window | `@agent_tab_color` | literal colour for the rolled-up state, or unset |
+| window | `@agent_tab_icon` | icon plus a trailing space, or unset |
+| global | `@agent_summary` | e.g. `󰂞 1  2  3`, or empty |
+| global | `@agent_bin`, `@agent_version` | the binary path that hooks run, and its version |
+
+### Writes and races
+
+Each `report`, `focus` and `reconcile` locks `<canonical socket path>.tmux-agent.lock`. The file sits beside the socket, in tmux's 0700 directory, and is locked with `std::fs::File::lock` (Rust 1.89+). Under the lock the command:
+
+1. reads the config, all panes (`list-panes -a`) and all clients (`list-clients`) in one tmux call;
+2. applies the pure transition function;
+3. writes the pane options, the changed window rollups and the summary in one `;`-chained tmux call.
+
+The lock gives mutual exclusion, so two panes in one window that report at the same moment cannot leave a stale rollup. The ordering of one pane's reports comes from the plugin's promise chain. Each pane has one writer.
+
+### Ownership
+
+- The owner is the Claude engine PID plus its start time. The start time comes from `proc_pidinfo` on macOS and `/proc/<pid>/stat` on Linux.
+- The owner is alive unless `kill(pid, 0)` returns `ESRCH` or the start time differs. `EPERM` counts as alive.
+- A report from the owner PID is accepted whatever its session id.
+- A report from another PID is dropped while the owner is alive, including `claim`. A `release` from a non-owner does nothing.
+- If the pane is unowned or its owner is dead, any report counts as an implicit `claim` first.
+
+### Cleanup
+
+| Trigger | Action |
+|---|---|
+| `session.end` | `release`, or `reset` for `/clear` and resume |
+| tmux `pane-exited`, `pane-died`, `after-kill-pane`, `window-layout-changed`, `window-linked`, `window-unlinked`, `session-closed` | full `reconcile` |
+| break, join, swap and move-pane | Pane options travel with the pane. The layout and link hooks run `reconcile`, which recomputes both windows. |
+| `respawn-pane -k`, a Claude crash, or `kill -9` | No hook fires. `reconcile` finds the owner dead and clears the pane. |
+
+`reconcile` recomputes every window's rollup from its current panes. It unsets the window options on windows with no stateful panes, and drops the state of panes whose owner is dead. It exits early when the pane→window→state map has not changed. It runs:
+- on `client-attached`;
+- after every `focus`;
+- before `jump`, `pick` and `list`;
+- once per `status-interval`, through the `#(#{@agent_bin} reconcile)` token in the status-right snippet. That costs one fork per refresh, and the command prints nothing.
+
+## Display
+
+### Tab colour and icon
+
+The binary publishes `@agent_tab_color` and `@agent_tab_icon` per window. There are two modes, set by `@tmux-agent-tab-mode`:
+
+- **`options`** (default). The binary only publishes, and the theme reads the options. For catppuccin, which bakes inline colours into its formats, replace your existing catppuccin window lines with these, before catppuccin loads:
+
+  ```tmux
+  set -g @catppuccin_window_number_color         "#{?#{@agent_tab_color},#{@agent_tab_color},#{@thm_overlay_2}}"
+  set -g @catppuccin_window_current_number_color "#{?#{@agent_tab_color},#{@agent_tab_color},#{@thm_mauve}}"
+  set -g @catppuccin_window_text         "  #{@agent_tab_icon}#W"
+  set -g @catppuccin_window_current_text "  #{@agent_tab_icon}#W"
+  ```
+
+  Verified on tmux 3.8 with catppuccin 2.1.3: the number block of an agent window takes the state colour, and other windows keep the theme colour. The load order of tmux-agent against catppuccin does not matter.
+
+- **`style`**. For themes without inline colours, the binary also sets a per-window `window-status-style` and `window-status-current-style`. The value is the global style plus `,bg=<colour>`, so the user's fg and attributes survive. Both are unset with `-wu` when the window has no state.
+
+### Pane borders
+
+Each pane with a state other than idle gets a per-pane `pane-border-style` and `pane-active-border-style` of `fg=<colour>`. They are unset (`-pu`) on idle or clear, which restores the user's global styles. Turn this off with `@tmux-agent-pane-border off`.
+
+### Status-right summary
+
+`@agent_summary` counts agent panes by displayed state across the server, e.g. `󰂞 1  2  3`. It deduplicates by `#{pane_id}` over `list-panes -a`, because grouped sessions list the same panes more than once. Idle agents are not counted.
+
+Put this in your main tmux config, after your own `status-right` and before continuum's `run-shell`:
+
+```tmux
+set -ag status-right "#{@agent_summary}#(#{@agent_bin} reconcile)"
+```
+
+The catppuccin module form, in the same shape as your midway module:
+
+```tmux
+set-environment -gh MODULE_NAME agents
+set -g @catppuccin_agents_icon "󰚩 "
+set -g @catppuccin_agents_color "#{@thm_peach}"
+set -g @catppuccin_agents_text " #{@agent_summary}#(#{@agent_bin} reconcile)"
+source-file <catppuccin>/utils/status_module.conf
+set -ag status-right "#{E:@catppuccin_status_agents}"
+```
+
+The Home Manager module exports the plain form as the read-only option `programs.tmux-agent.statusRightSnippet`.
+
+### Icons and colours
+
+| State | Options (icon, colour) | Default icon | Default colour |
+|---|---|---|---|
+| needs-input | `@tmux-agent-icon-needs-input`, `@tmux-agent-color-needs-input` | `󰂞` | `#f38ba8` |
+| done | `@tmux-agent-icon-done`, `@tmux-agent-color-done` | `` | `#a6e3a1` |
+| working | `@tmux-agent-icon-working`, `@tmux-agent-color-working` | `` | `#f9e2af` |
+
+A colour may be a format such as `#{@thm_red}`. The binary expands it once, with `#{E:@tmux-agent-color-<state>}` in the same call that reads the config. It publishes the literal colour, so neither mode expands formats twice.
+
+## Navigation
+
+| Key (default) | Option | Action |
+|---|---|---|
+| `prefix a` | `@tmux-agent-jump-key` | Jump to the most urgent agent pane on the server: needs-input first, then unseen done, oldest `since` first. Pressing it again cycles to the next one after the current pane. |
+| `prefix A` | `@tmux-agent-pick-key` | A `display-menu` of agent panes, sorted by urgency (details below). |
+| `prefix w` | `@tmux-agent-choose-tree` (`on` or `off`) | `choose-tree -Zw` with a `-F` copied from tmux's default plus `#{@agent_tab_icon}` on window rows only. `off` leaves the user's binding alone. |
+
+The picker:
+- Each item shows the icon, `session:window.pane`, the window name, the cwd and the time in state.
+- Items are capped at `client_height - 2`. A final "… N more" item opens `choose-tree`.
+- `#` is escaped as `##` in every field.
+- Items 1–9 and 0 get mnemonic keys.
+
+Keys:
+- Bindings use `bind-key -N 'tmux-agent: <action>'`. Ownership is detected through `list-keys -T prefix -F '#{key_string}\t#{key_note}'`.
+- A key is bound only when it is free or already owned by tmux-agent. Otherwise `init` leaves the existing binding, and `doctor` reports the conflict.
+- `prefix w` is the exception, controlled by its own option.
+- Every binding passes `#{client_name}`, so the jump moves the client that pressed the key.
+
+## Binary commands
+
+| Command | Called by | Purpose |
+|---|---|---|
+| `init` | `tmux-agent.tmux` (`run-shell`) | Set `focus-events on`. Read the config, register the tmux hooks at a fixed index, bind keys, publish `@agent_bin` and `@agent_version`, then `reconcile`. Idempotent on re-source. |
+| `report <event>` | Claude plugin | Events: `claim`, `reset`, `working`, `ask`, `resume`, `done`, `error`, `cancel`, `release`. Flags: `--proto`, `--pane`, `--socket`, `--pid`, `--session`, `--bg`, `--plugin-version`. |
+| `focus --pane` | the `pane-focus-in` hook | Apply `focus`, then `reconcile`. |
+| `reconcile` | hooks, status token, navigation | Clear dead state and recompute rollups and the summary. Prints nothing. |
+| `jump`, `pick` | key bindings | Navigation. |
+| `list [--json]` | user, scripts | Agent panes and their states. |
+| `doctor` | user | Checks below. |
+
+Every command except `doctor` and `list` exits 0 on tmux errors, so a missing server never surfaces in Claude.
+
+`doctor` checks:
+- the tmux server version, and that `focus-events` is on;
+- that hooks are registered at our index (`show-hooks -gw` for pane hooks, `show-hooks -g` for the rest), and whether session-level hooks shadow them;
+- key conflicts;
+- that `@agent_bin` exists and matches the running binary;
+- the plugin and protocol versions last reported per pane, and stale state;
+- whether any window format references `@agent_tab_color`.
+
+Hooks are written as:
+
+```tmux
+run-shell -b 'b="#{@agent_bin}"; [ -x "$b" ] && "$b" focus --pane #{hook_pane} --socket #{socket_path}; true'
+```
+
+They pass `#{hook_pane}`. `$TMUX_PANE` is unset in `run-shell`, and `#{pane_id}` names the wrong pane. `run-shell tmux-agent init` must come after the user's own `set-hook` lines, because an unindexed `set-hook` replaces the whole hook array.
+
+## Configuration
+
+All options are tmux user options, read in one call. The Home Manager module writes them.
+
+| Option | Default |
+|---|---|
+| `@tmux-agent-bin` | the path of the binary running `init`; Home Manager sets the profile path |
+| `@tmux-agent-tab-mode` | `options` |
+| `@tmux-agent-pane-border` | `on` |
+| `@tmux-agent-icon-<state>`, `@tmux-agent-color-<state>` | see Icons and colours |
+| `@tmux-agent-jump-key`, `@tmux-agent-pick-key` | `a`, `A` |
+| `@tmux-agent-choose-tree` | `on` |
+
+## Install
+
+### Nix flake
+
+Packages:
+- `packages.tmux-agent` (also the `default`): `buildRustPackage` from `nix/package.nix`, with `nativeCheckInputs = [ tmux ]`. It is wrapped with `--set-default TMUX_AGENT_TMUX`.
+- `packages.tmux-plugin`: `tmuxPlugins.mkTmuxPlugin { pluginName = "tmux-agent"; rtpFilePath = "tmux-agent.tmux"; }` from `tmux/`, with the binary path substituted. Home Manager requires the `tmuxplugin-` pname and the `.rtp` attribute that this provides.
+- `packages.claude-plugin`: `plugin/`, with the absolute binary path substituted as the `binary` default.
+
+Other outputs: `overlays.default`, and `homeModules.default` (aliased as `homeManagerModules.default`). The module provides:
+- `programs.tmux-agent.enable` adds the tmux plugin to `programs.tmux.plugins`, writes the `@tmux-agent-*` options in that entry's `extraConfig`, and puts the binary in `home.packages`.
+- Options for icons, colours, keys, tab mode and border.
+- `programs.tmux-agent.claudePlugin.enable` sets `programs.claude-code.plugins.tmux-agent`. This works with `package = null` for the ASBX Claude.
+- The read-only `statusRightSnippet`.
+
+The catppuccin and status-right snippets stay in the user's own config, because their placement relative to catppuccin and continuum is the user's.
+
+### Manual
+
+`cargo install --path .`, then `run-shell "tmux-agent init"` in `tmux.conf`.
+
+### Claude plugin without Nix
+
+`.claude-plugin/marketplace.json` at the repo root lists `plugin/`.
+1. Add the marketplace: `/plugin marketplace add ~/workplace/tmux-agent` before the repo is pushed, or `/plugin marketplace add <owner>/tmux-agent` after.
+2. Install: `/plugin install tmux-agent --marketplace <owner>/tmux-agent`.
+
+## Repository layout
+
+```
+.claude-plugin/marketplace.json
+plugin/.claude-plugin/plugin.json      name, version, userConfig (binary, graceMs)
+plugin/hooks/hooks.json                {"modules": ["./register.ts"]}
+plugin/hooks/register.ts
+plugin/hooks/*.test.ts
+src/main.rs        CLI (lexopt)
+src/state.rs       transition table, rollup, summary (pure)
+src/tmux.rs        tmux lookup, batched calls, quoting
+src/lock.rs        socket lock
+src/owner.rs       PID liveness and start time
+src/config.rs
+src/init.rs  src/nav.rs  src/doctor.rs
+tests/             integration tests on private tmux servers
+tmux/tmux-agent.tmux
+nix/package.nix  nix/tmux-plugin.nix  nix/claude-plugin.nix  nix/hm-module.nix
+flake.nix  flake.lock  Cargo.toml  Cargo.lock
+.github/workflows/ci.yml
+```
+
+Dependencies: `libc` and `lexopt`. `list --json` output is written by hand.
+
+## Portability
+
+- The binary runs no shell tools, so BSD and GNU differences do not apply.
+- tmux lookup order:
+  1. `TMUX_AGENT_TMUX`
+  2. the server's own executable, from the PID in `$TMUX` (`/proc/<pid>/exe` or `proc_pidpath`)
+  3. `PATH`
+  4. `/etc/profiles/per-user/$USER/bin`, `~/.local/state/nix/profile/bin`, `~/.nix-profile/bin`, `/run/current-system/sw/bin`, `/nix/var/nix/profiles/default/bin`
+  5. `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`
+- Always pass `-S <socket>`. Always target a pane id (`%N`) or window id (`@N`), never an index.
+- Use tab as the `-F` field separator, and reject values that contain tabs or newlines.
+- Requires tmux 3.3 or later, which `doctor` checks. `focus-events on` is required; with it off, moving between panes inside tmux never marks one seen.
+- Amazon Linux 2023 ships tmux 3.2a, so it needs a Nix or Homebrew tmux.
+
+## Testing
+
+- **Rust unit tests**: the transition table, ownership, rollup, summary, jump order, option parsing and quoting.
+- **Rust integration tests**: a private tmux server per test.
+  - Spawned commands run with a cleared environment plus PATH and HOME, a short `TMUX_TMPDIR` such as `/tmp/ta-<pid>` (sockets have a 104-byte path limit), and an explicit `-S`.
+  - The server runs `focus-events on`. Focus tests attach a control client (`tmux -C attach`, with stdin held open) and target it with `-c`.
+  - Cases:
+    - multiple panes per window, and zoom;
+    - break, join, swap, kill-pane, kill-window, kill-session and respawn-pane;
+    - a dead owner;
+    - a refused nested claim, and an ignored non-owner release;
+    - concurrent reports;
+    - seen on arrival.
+  - `TMUX_AGENT_SKIP_TMUX_TESTS` skips them where tmux is missing.
+- **Plugin tests**: `claude plugin test plugin/`, with the local event harness and no model calls.
+  - Each test replays an event sequence and captures the argv through an `on('process.run', ...)` hook.
+  - Cases:
+    - `/clear` then a turn;
+    - `/resume` then a turn;
+    - a reload mid-turn keeps `working`;
+    - parallel subagents where one asks;
+    - two parallel asks;
+    - a Notification arriving after resume shows no red;
+    - Esc during an ask;
+    - background tasks at Stop.
+- **Flake check**: evaluate the Home Manager module and check the generated `tmux.conf`. The `@tmux-agent-*` lines must come before the plugin's `run-shell`, and the rtp path must exist.
+- **CI** (GitHub Actions):
+  - Rust job on `ubuntu-latest` and `macos-latest`: fmt, clippy `-D warnings` and test. One Ubuntu job pins tmux 3.3a to hold the floor.
+  - Nix job: `nix flake check -L` on both.
+  - Plugin job: `claude plugin validate` and `plugin test`, with `continue-on-error` until V-5 is resolved.
+
+## Verified
+
+- **Claude PID:** `sh -c 'echo $PPID'` from `$.process.run` returns the engine process on 2.1.316.
+- **Classic hooks:** mods receive them with no `settings.json` entries. `Stop` and `PreToolUse` were seen live.
+- **Turn ends:** `turn.complete` fires for every agent's turn with its `agentId`, and for the main thread without one.
+- **Background Bash:** `$.agent.list()` excludes it. `Stop.background_tasks` lists it, and a finished background shell wakes the main thread.
+- **`/clear` and resume:** no `session.start` fires after them. `session.end` fires with a reason.
+- **`pane-focus-in`** (local, tmux 3.8): fires for select-pane, select-window, switch-client, kill-pane, attach and the terminal's focus-in sequence.
+- **Style mode:** per-window `window-status-style` expands `#{@thm_red}`.
+- **catppuccin:** recolours through `@agent_tab_color` (snippet above).
+- **Linux desktop:** runs the same Claude build as the laptop, 2.1.316.1544, so it has the same plugin API.
+
+## To verify
+
+| # | Question | Why it matters |
+|---|---|---|
+| V-1 | Does any event fire between a permission approval and the tool's run, for example the `tool.call` or `tool.check` ordering? | Decides whether red clears on approval or only when the tool ends. |
+| V-2 | Which events fire when the user rejects a dialog with "No, and tell Claude…"? | The ask must close. |
+| V-3 | Does a finished background subagent wake the main thread? | If yes, drop the agent-turn fallback. |
+| V-4 | Does `list-keys -F` with `#{key_note}` work on tmux 3.3? | Key ownership detection, or a higher tmux floor. |
+| V-5 | Can public npm `@anthropic-ai/claude-code` run `plugin validate` and `plugin test` in CI with no login? | The plugin CI job. |
+| V-6 | Does `pane-focus-in` fire over SSH from WezTerm? | Seen on terminal focus. |
+| V-8 | Do `PermissionRequest` and `Notification` reach the mod live? Only the types confirm it so far. | Asks. |

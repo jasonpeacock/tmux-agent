@@ -1,0 +1,17 @@
+[package]
+name = "tmux-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+authors = ["Jason Peacock"]
+description = "Show Claude Code agent status on tmux window tabs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+libc = "0.2"
+lexopt = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

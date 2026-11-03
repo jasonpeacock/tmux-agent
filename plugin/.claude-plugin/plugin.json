@@ -1,0 +1,23 @@
+{
+  "name": "tmux-agent",
+  "version": "0.1.0",
+  "description": "Report Claude Code agent status to tmux window tabs through the tmux-agent binary.",
+  "author": {
+    "name": "Jason Peacock"
+  },
+  "license": "MIT OR Apache-2.0",
+  "userConfig": {
+    "binary": {
+      "type": "string",
+      "title": "tmux-agent binary",
+      "description": "Path to the tmux-agent binary, or a name found on PATH.",
+      "default": "tmux-agent"
+    },
+    "graceMs": {
+      "type": "number",
+      "title": "Prompt grace delay (ms)",
+      "description": "How long a prompt must stay open before the tab shows needs-input.",
+      "default": 1000
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "tmux-agent",
+  "description": "Claude Code agent status on tmux window tabs",
+  "owner": {
+    "name": "Jason Peacock"
+  },
+  "plugins": [
+    {
+      "name": "tmux-agent",
+      "source": "./plugin"
+    }
+  ]
+}
