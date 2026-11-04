@@ -61,6 +61,9 @@ pub struct Bg {
     /// The session id from the engine's `--session-id`.
     pub id: String,
     pub rec: Rec,
+    /// The engine's Claude config dir, from `--claude-dir`, where its fleet
+    /// viewers' beacons are; empty when unknown.
+    pub claude: String,
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +79,8 @@ pub struct Pane {
     pub pane_index: String,
     pub window_name: String,
     pub path: String,
+    /// The terminal title: names the job a fleet viewer shows.
+    pub title: String,
     /// What the pane stores now, and what it will store after `sync`.
     pub orig: Option<Rec>,
     pub rec: Option<Rec>,
@@ -109,14 +114,15 @@ const G_FMT: &str = concat!(
 );
 const C_FMT: &str =
     "\t#{client_name}\t#{pane_id}\t#{client_flags}\t#{client_height}\t#{client_width}";
-// Free-text fields go last: the final field may hold tabs.
+// Free-text fields go last: the final field may hold tabs. tmux drops
+// control characters from a title, so `pane_title` holds none.
 const P_FMT: &str = concat!(
     "\t#{pane_id}\t#{window_id}\t#{pane_dead}\t#{window_index}\t#{pane_index}",
     "\t#{@agent_pane_loop}\t#{@agent_pane_asks}\t#{@agent_pane_bg}",
     "\t#{@agent_pane_pid}\t#{@agent_pane_pid_start}\t#{@agent_pane_since}\t#{@agent_pane_session}",
     "\t#{@agent_pane_proto}\t#{@agent_pane_plugin}\t#{@agent_pane_attached}\t#{pane_pid}",
     "\t#{@agent_window_state}\t#{@agent_tab_color}\t#{@agent_tab_icon}",
-    "\t#{session_name}\t#{window_name}\t#{pane_current_path}",
+    "\t#{pane_title}\t#{session_name}\t#{window_name}\t#{pane_current_path}",
 );
 
 pub const DEFAULT_ICONS: [&str; 3] = ["\u{f009e}", "\u{f058}", "\u{f110}"];
@@ -275,8 +281,8 @@ fn parse_client(rest: &str) -> Option<Client> {
 }
 
 fn parse_pane(rest: &str) -> Option<Pane> {
-    let f: Vec<&str> = rest.splitn(22, '\t').collect();
-    if f.len() < 22 {
+    let f: Vec<&str> = rest.splitn(23, '\t').collect();
+    if f.len() < 23 {
         return None;
     }
     let rec = parse_rec(&f[5..15]);
@@ -292,9 +298,10 @@ fn parse_pane(rest: &str) -> Option<Pane> {
         win_state: f[16].to_owned(),
         win_color: f[17].to_owned(),
         win_icon: f[18].to_owned(),
-        session_name: f[19].to_owned(),
-        window_name: f[20].to_owned(),
-        path: f[21].to_owned(),
+        title: f[19].to_owned(),
+        session_name: f[20].to_owned(),
+        window_name: f[21].to_owned(),
+        path: f[22].to_owned(),
     })
 }
 
@@ -309,19 +316,60 @@ pub fn parse_bg(v: &str) -> Vec<Bg> {
     let mut out: Vec<Bg> = Vec::new();
     for r in v.split(BG_SEP).filter(|r| !r.is_empty()) {
         let f: Vec<&str> = r.split(BG_FIELD_SEP).collect();
-        if f.len() != 10 || f[0].is_empty() || out.iter().any(|b| b.id == f[0]) {
+        // Ten fields, and an eleventh, the config dir, once the engine reported one.
+        if !(10..=11).contains(&f.len()) || f[0].is_empty() || out.iter().any(|b| b.id == f[0]) {
             continue;
         }
-        let mut fields = f[1..].to_vec();
+        let mut fields = f[1..10].to_vec();
         fields.push("");
         if let Some(rec) = parse_rec(&fields) {
             out.push(Bg {
                 id: f[0].to_owned(),
                 rec,
+                claude: f.get(10).map_or(String::new(), |d| unescape(d)),
             });
         }
     }
     out
+}
+
+/// A path as a record field: `%XX` for `%`, the separators and control
+/// characters, so it may hold any of them.
+fn escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c == '%' || BG_SEP.contains(c) || BG_FIELD_SEP.contains(c) || c.is_control() {
+            let mut b = [0; 4];
+            for byte in c.encode_utf8(&mut b).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let hex = b
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok());
+        match (b[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(v)) => {
+                out.push(v);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The `@agent_bg` value for `bg`, empty when there are none.
@@ -346,6 +394,10 @@ pub fn format_bg(bg: &[Bg]) -> String {
                 clean(&r.proto),
                 clean(&r.plugin),
             ]
+            .into_iter()
+            // Only when known, so an older binary still reads the record.
+            .chain((!b.claude.is_empty()).then(|| escape(&b.claude)))
+            .collect::<Vec<_>>()
             .join(BG_FIELD_SEP)
         })
         .collect::<Vec<_>>()
@@ -380,9 +432,9 @@ Gt\t/bin/ta\t\toff\t\t\tW\t#ff0000\t\t\t3.8\tS\tdots\t686fd2bf-cb86|done|0|0|42|
 Gt\tignored
 Ct\t/dev/ttys001\t%1\tattached,focused,UTF-8\t50\t120
 Ct\t/dev/ttys002\t%2\tattached\t40\t80
-Pt\t%1\t@1\t0\t1\t1\tdone\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\t686fd2bf\t77\tdone\t#a6e3a1\t \tmain\tzsh\t/home/u
-Pt\t%2\t@1\t0\t1\t2\t\t\t\t\t\t\t\t\t\t\t78\tdone\t#a6e3a1\t \tmain\tvim\t/a\tb
-Pt\t%1\t@1\t0\t1\t1\tdone\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\t686fd2bf\t77\tdone\t#a6e3a1\t \tgrouped\tzsh\t/home/u
+Pt\t%1\t@1\t0\t1\t1\tdone\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\t686fd2bf\t77\tdone\t#a6e3a1\t \t✳ job\tmain\tzsh\t/home/u
+Pt\t%2\t@1\t0\t1\t2\t\t\t\t\t\t\t\t\t\t\t78\tdone\t#a6e3a1\t \t\tmain\tvim\t/a\tb
+Pt\t%1\t@1\t0\t1\t1\tdone\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\t686fd2bf\t77\tdone\t#a6e3a1\t \t✳ job\tgrouped\tzsh\t/home/u
 default
 underscore
 ";
@@ -446,6 +498,8 @@ underscore
             }
         );
         assert_eq!(s.panes[1].path, "/a\tb");
+        assert_eq!((p.title.as_str(), s.panes[1].title.as_str()), ("✳ job", ""));
+        assert_eq!(p.session_name, "main");
     }
 
     #[test]
@@ -454,7 +508,7 @@ underscore
         // carry this call's tag, so all are dropped.
         let out = "\
 Gt\t\t\t\t\t\t\t\t\t\t3.8\t
-Pt\t%1\t@1\t0\t1\t1\tworking\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\t\t77\tworking\t#f\tW \tmain\tzsh\t/x
+Pt\t%1\t@1\t0\t1\t1\tworking\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\t\t77\tworking\t#f\tW \t✳ job\tmain\tzsh\t/x
 C\tfake\t%1\tfocused\t40\t80
 Cu\tfake\t%1\tfocused\t40\t80
 fg=blue
@@ -487,7 +541,15 @@ bold
         // Separators and control characters cannot leak out of a field.
         let mut b = bg[0].clone();
         b.rec.session = "a b|c\td".into();
-        assert_eq!(parse_bg(&format_bg(&[b]))[0].rec.session, "abcd");
+        assert_eq!(parse_bg(&format_bg(&[b.clone()]))[0].rec.session, "abcd");
+
+        // The config dir, an eleventh field, holds any path.
+        b.claude = "/Users/a b/100%|x\ny/.claude".into();
+        let v = format_bg(&[b.clone()]);
+        assert!(v.ends_with("|/Users/a%20b/100%25%7Cx%0Ay/.claude"), "{v}");
+        assert_eq!(parse_bg(&v)[0].claude, b.claude);
+        assert_eq!(parse_bg(&format!("{v}|extra")), Vec::new());
+        assert_eq!(unescape("%zz%4"), "%zz%4");
     }
 
     #[test]

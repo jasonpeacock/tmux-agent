@@ -5,6 +5,7 @@
 mod attach;
 mod doctor;
 mod engine;
+mod fleet;
 mod init;
 mod lock;
 mod nav;
@@ -98,6 +99,7 @@ fn parse(mut parser: lexopt::Parser, first_value_is_event: bool) -> Result<Args,
             Long("bg") => a.report.bg = parser.value()?.string()?.parse().unwrap_or(0),
             Long("proto") => a.report.proto = Some(parser.value()?.string()?),
             Long("plugin-version") => a.report.plugin = Some(parser.value()?.string()?),
+            Long("claude-dir") => a.report.claude_dir = Some(parser.value()?.string()?),
             Long("client") => a.client = parser.value()?.string()?,
             Long("json") => a.json = true,
             Value(v) if want_event => {

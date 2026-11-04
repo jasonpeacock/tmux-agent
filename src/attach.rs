@@ -2,7 +2,9 @@
 //! which session, from one `ps` call. See docs/design.md, "Background
 //! sessions (claude attach)".
 
+use crate::fleet;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// An attach token must be at least this long to name a session.
@@ -16,29 +18,54 @@ pub struct PsRow {
     pub args: String,
 }
 
-/// The process table, read at most once per command and only when needed.
-pub struct Procs(Option<Option<Vec<PsRow>>>);
+/// The process table, read at most once per command and only when needed,
+/// and Claude's config dir, where fleet viewers leave their beacons.
+pub struct Procs {
+    rows: Option<Option<Vec<PsRow>>>,
+    claude: Option<PathBuf>,
+}
 
 impl Procs {
     pub fn new() -> Procs {
-        Procs(None)
+        Procs {
+            rows: None,
+            claude: fleet::claude_dir(),
+        }
     }
 
-    /// A table that never runs `ps`.
+    /// A table that never runs `ps`, and no config dir.
     #[cfg(test)]
     pub fn fixed(rows: Vec<PsRow>) -> Procs {
-        Procs(Some(Some(rows)))
+        Procs {
+            rows: Some(Some(rows)),
+            claude: None,
+        }
     }
 
     /// A table whose `ps` failed.
     #[cfg(test)]
     pub fn failed() -> Procs {
-        Procs(Some(None))
+        Procs {
+            rows: Some(None),
+            claude: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_claude(mut self, dir: &Path) -> Procs {
+        self.claude = Some(dir.to_owned());
+        self
     }
 
     /// The rows, or `None` when `ps` failed.
     pub fn get(&mut self) -> Option<&[PsRow]> {
-        self.0.get_or_insert_with(scan).as_deref()
+        self.rows.get_or_insert_with(scan).as_deref()
+    }
+
+    /// This command's own Claude config dir, for records whose engine did
+    /// not report one.
+    pub fn claude_dir(&self) -> Option<&Path> {
+        self.claude.as_deref()
     }
 }
 
@@ -167,7 +194,7 @@ pub fn matches(id: &str, token: &str) -> bool {
 /// token names one of `ids`, the pane whose `pane_pid` is the process or an
 /// ancestor of it. Returns (pane id, session id) pairs, one per pane.
 pub fn attachments(rows: &[PsRow], panes: &[(u32, &str)], ids: &[&str]) -> Vec<(String, String)> {
-    let parent: HashMap<u32, u32> = rows.iter().map(|r| (r.pid, r.ppid)).collect();
+    let parent = parents(rows);
     let mut out: Vec<(String, String)> = Vec::new();
     for r in rows {
         let Some(token) = attach_token(&r.args) else {
@@ -176,22 +203,36 @@ pub fn attachments(rows: &[PsRow], panes: &[(u32, &str)], ids: &[&str]) -> Vec<(
         let Some(id) = ids.iter().find(|id| matches(id, token)) else {
             continue;
         };
-        // Bounded by the table's size, so a PID cycle cannot loop forever.
-        let mut pid = r.pid;
-        for _ in 0..=rows.len() {
-            if let Some((_, pane)) = panes.iter().find(|(p, _)| *p == pid && pid != 0) {
-                if !out.iter().any(|(p, _)| p == pane) {
-                    out.push(((*pane).to_owned(), (*id).to_owned()));
-                }
-                break;
-            }
-            match parent.get(&pid) {
-                Some(&pp) if pp > 1 && pp != pid => pid = pp,
-                _ => break,
-            }
+        if let Some(pane) = walk(&parent, panes, r.pid)
+            && !out.iter().any(|(p, _)| p == pane)
+        {
+            out.push((pane.to_owned(), (*id).to_owned()));
         }
     }
     out
+}
+
+/// The pane whose `pane_pid` is `pid` or an ancestor of it.
+pub fn pane_of<'a>(rows: &[PsRow], panes: &[(u32, &'a str)], pid: u32) -> Option<&'a str> {
+    walk(&parents(rows), panes, pid)
+}
+
+fn parents(rows: &[PsRow]) -> HashMap<u32, u32> {
+    rows.iter().map(|r| (r.pid, r.ppid)).collect()
+}
+
+fn walk<'a>(parent: &HashMap<u32, u32>, panes: &[(u32, &'a str)], mut pid: u32) -> Option<&'a str> {
+    // Bounded by the table's size, so a PID cycle cannot loop forever.
+    for _ in 0..=parent.len() {
+        if let Some((_, pane)) = panes.iter().find(|(p, _)| *p == pid && pid != 0) {
+            return Some(pane);
+        }
+        match parent.get(&pid) {
+            Some(&pp) if pp > 1 && pp != pid => pid = pp,
+            _ => return None,
+        }
+    }
+    None
 }
 
 #[cfg(test)]

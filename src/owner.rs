@@ -7,6 +7,16 @@ pub fn start_time(pid: u32) -> Option<String> {
     imp::start_time(pid)
 }
 
+/// The process's start time in whole seconds since the epoch, where the
+/// start time is kept in that form (macOS). `None` elsewhere.
+pub fn epoch_start(pid: u32) -> Option<u64> {
+    if cfg!(target_os = "macos") {
+        start_time(pid)?.split('.').next()?.parse().ok()
+    } else {
+        None
+    }
+}
+
 /// True when `pid` names a live process that started at `start`. An empty
 /// `start` (never recorded) checks liveness alone.
 pub fn alive(pid: u32, start: &str) -> bool {

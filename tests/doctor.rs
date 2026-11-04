@@ -39,7 +39,7 @@ impl Server {
              TMUX_AGENT_SKIP_TMUX_TESTS=1 to skip these tests",
         );
         // Short: socket paths are limited to about 104 bytes.
-        let dir = PathBuf::from(format!("/tmp/ta-dt-{}-{name}", std::process::id()));
+        let dir = PathBuf::from(format!("{}/ta-dt-{}-{name}", scratch(), std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let s = Server {
             tmux,
@@ -421,4 +421,15 @@ fn agent_bin_copies_and_unsafe_paths() {
         l.starts_with("FAIL ") && l.contains("breaks the hook command"),
         "{stdout}"
     );
+}
+
+/// Where tests put scratch dirs: /var/tmp, which is on disk, else /tmp (the
+/// Nix build sandbox has no /var/tmp). Short: a socket path holds at most
+/// 104 bytes.
+fn scratch() -> &'static str {
+    if std::path::Path::new("/var/tmp").is_dir() {
+        "/var/tmp"
+    } else {
+        "/tmp"
+    }
 }

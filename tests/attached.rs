@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{COLORS, ICONS, Proc, Server, agent_cmd};
+use common::{COLORS, ICONS, Proc, Server, agent_cmd, scratch};
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -426,7 +426,7 @@ fn socket_used(log: &Path) -> String {
 fn attached_report_without_tmux_env_uses_the_default_socket() {
     // No real tmux runs here, so the user's default server is never touched.
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(format!("/tmp/ta-d-{}-{n}", std::process::id()));
+    let dir = PathBuf::from(format!("{}/ta-d-{}-{n}", scratch(), std::process::id()));
     let (bin, log) = recording_tmux(&dir.join("fake"));
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
@@ -466,4 +466,99 @@ fn attached_report_without_tmux_env_uses_the_default_socket() {
     for d in [dir.join("fake"), sock_dir, dir] {
         let _ = std::fs::remove_dir(d);
     }
+}
+
+/// A Claude process in a pane that shows a background job in its own
+/// terminal (the fleet view, after the left-arrow handoff): the pane process
+/// is the viewer. It claims its pane, then writes the beacon Claude writes
+/// while attached; the title names the job. See docs/design.md, "Fleet
+/// viewers".
+#[test]
+fn a_fleet_viewer_pane_shows_the_job_its_title_names() {
+    let Some(s) = Server::new() else { return };
+    let e = Engine::spawn();
+    let pane = s.tmux(&[
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        "main:",
+        "printf '\\033]2;krate-paa-docs\\033\\\\'; exec sleep 120",
+    ]);
+    let viewer: u32 = s.opt(&pane, "pane_pid").parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while s.opt(&pane, "pane_title") != "krate-paa-docs" {
+        assert!(Instant::now() < deadline, "title never set");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    s.report("done", &pane, viewer, &[]);
+    s.focus(&pane);
+
+    // The job's config dir, which its engine reports. The binary's own (the
+    // scratch CLAUDE_CONFIG_DIR every test gets) holds nothing, as for a
+    // reconcile that tmux runs with another environment.
+    let claude = s.dir.join("job-claude");
+    std::fs::create_dir_all(claude.join("daemon/attach-journal")).unwrap();
+    std::fs::create_dir_all(claude.join("sessions")).unwrap();
+    std::fs::write(
+        claude.join(format!("sessions/{}.json", e.pid)),
+        format!(
+            "{{\"pid\":{},\"sessionId\":\"{}\",\"kind\":\"bg\",\"name\":\"krate-paa-docs\",\
+             \"nameSource\":\"user\",\"jobId\":\"{}\"}}",
+            e.pid,
+            e.id,
+            e.short()
+        ),
+    )
+    .unwrap();
+    bg_report(
+        &s,
+        "working",
+        &e,
+        &["--claude-dir", claude.to_str().unwrap()],
+    );
+    assert_eq!(
+        state(&s, &pane),
+        "idle",
+        "no beacon: the pane keeps its own session"
+    );
+
+    let beacon = claude.join("daemon/attach-journal/fd36231f.json");
+    std::fs::write(&beacon, fleet_beacon(viewer)).unwrap();
+    s.reconcile();
+    assert_eq!(state(&s, &pane), "working");
+    assert_eq!(s.pane_opt(&pane, "@agent_pane_attached"), e.short());
+    assert_eq!(s.pane_opt(&pane, "@agent_pane_pid"), e.pid());
+    assert_eq!(s.summary(), format!("{} 1", ICONS[2]));
+    bg_report(&s, "done", &e, &[]);
+    assert_eq!(state(&s, &pane), "done");
+
+    // Back at the fleet list the beacon is gone; the pane shows no job.
+    std::fs::remove_file(&beacon).unwrap();
+    s.reconcile();
+    assert_eq!(state(&s, &pane), "");
+    assert_eq!(s.summary(), "");
+}
+
+/// The beacon Claude writes while `pid` is attached to a job in the fleet
+/// view, with Claude's `procStart`: field 22 of `/proc/<pid>/stat` on Linux.
+/// Elsewhere a live process that started before the beacon is accepted.
+fn fleet_beacon(pid: u32) -> String {
+    let start = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|st| {
+            let rest = &st[st.rfind(')')? + 1..];
+            rest.split_whitespace().nth(19).map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    format!(
+        "{{\"gestureId\":\"fd36231f\",\"surface\":\"fleet\",\"startedAtEpochMs\":{now},\
+         \"attempt\":1,\"pid\":{pid},\"procStart\":\"{start}\",\"via\":\"cold\"}}"
+    )
 }

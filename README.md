@@ -70,6 +70,7 @@ A pane counts as seen once you focus it. A status-right summary counts the agent
 - A late notification after a prompt was answered does not bring red back.
 - A workflow's own agents finishing does not end the workflow's working state early.
 - Long-lived monitors and scheduled tasks are not counted as background work.
+- After the left-arrow handoff or `/fork` moves a session to the background, the pane's fleet view shows the job it is attached to, once that job has a name. An unnamed job, or one whose name another job shares, is not shown, rather than risk showing the wrong job.
 
 **Process lifecycle**
 - A Claude crash, `kill -9`, or `respawn-pane -k` is caught on the next refresh: the state of a dead owner is cleared.

@@ -52,6 +52,34 @@ test('a turn reports claim, working, then done with its pane and pid', async ($,
   expect(w.reports[2]).toEqual(expect.arrayContaining(['--bg', '0']))
 })
 
+async function claudeDirOf($: Parameters<Parameters<typeof test>[1]>[0], on: On, env: Record<string, string>) {
+  const w = world(on, env)
+  await $.session.start(START)
+  await w.clock.advance(0)
+  const r = w.reports.at(-1)!
+  const i = r.indexOf('--claude-dir')
+  return i < 0 ? undefined : r[i + 1]
+}
+
+test('an attached session reports its CLAUDE_CONFIG_DIR', async ($, on) => {
+  expect(await claudeDirOf($, on, { CLAUDE_CONFIG_DIR: '/cfg dir', HOME: '/home/u' })).toBe('/cfg dir')
+})
+
+test('an attached session reports ~/.claude by default', async ($, on) => {
+  expect(await claudeDirOf($, on, { HOME: '/home/u/' })).toBe('/home/u/.claude')
+})
+
+test('a relative config dir is not reported', async ($, on) => {
+  expect(await claudeDirOf($, on, { CLAUDE_CONFIG_DIR: 'rel' })).toBeUndefined()
+})
+
+test('a session in a pane passes no config dir', async ($, on) => {
+  const w = world(on, { ...TMUX_ENV, CLAUDE_CONFIG_DIR: '/cfg' })
+  await $.session.start(START)
+  await w.clock.advance(0)
+  expect(w.reports[0]).not.toContain('--claude-dir')
+})
+
 test('outside tmux an interactive session reports as attached, with no pane', async ($, on) => {
   const w = world(on, {})
   await $.session.start(START)
@@ -64,6 +92,7 @@ test('outside tmux an interactive session reports as attached, with no pane', as
     expect(r).toEqual(expect.arrayContaining(['--attached', '--pid', '4242', '--session', 'sid-1', '--proto', '1']))
     expect(r).not.toContain('--pane')
     expect(r).not.toContain('--socket')
+    expect(r).not.toContain('--claude-dir')
   }
   expect(w.reports[2]).toEqual(expect.arrayContaining(['--bg', '0']))
 

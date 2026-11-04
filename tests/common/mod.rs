@@ -127,7 +127,7 @@ impl Server {
         };
         // Short: a socket path holds at most 104 bytes.
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(format!("/tmp/ta-{}-{n}", std::process::id()));
+        let dir = PathBuf::from(format!("{}/ta-{}-{n}", scratch(), std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("s").to_str().unwrap().to_owned();
@@ -192,9 +192,16 @@ impl Server {
         s.strip_suffix('\n').unwrap_or(&s).to_owned()
     }
 
+    /// The Claude config dir tmux-agent sees: a scratch one, so a test
+    /// never reads the user's.
+    pub fn claude_dir(&self) -> PathBuf {
+        self.dir.join("claude")
+    }
+
     /// Runs tmux-agent with `--socket` appended.
     pub fn agent(&self, args: &[&str]) -> Output {
         agent_cmd(&self.tmux)
+            .env("CLAUDE_CONFIG_DIR", self.claude_dir())
             .args(args)
             .args(["--socket", &self.socket])
             .output()
@@ -338,5 +345,16 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.cmd().arg("kill-server").output();
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Where tests put scratch dirs: /var/tmp, which is on disk, else /tmp (the
+/// Nix build sandbox has no /var/tmp). Short: a socket path holds at most
+/// 104 bytes.
+pub fn scratch() -> &'static str {
+    if std::path::Path::new("/var/tmp").is_dir() {
+        "/var/tmp"
+    } else {
+        "/tmp"
     }
 }

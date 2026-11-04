@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{COLORS, ICONS, Proc, Server, agent_cmd, dead_pid, tmux_bin};
+use common::{COLORS, ICONS, Proc, Server, agent_cmd, dead_pid, scratch, tmux_bin};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -490,7 +490,7 @@ fn unknown_event_and_flags_are_ignored() {
 #[test]
 fn no_server_exits_zero_quickly() {
     let Some(tmux) = tmux_bin() else { return };
-    let dir = format!("/tmp/ta-{}-none", std::process::id());
+    let dir = format!("{}/ta-{}-none", scratch(), std::process::id());
     let _ = std::fs::create_dir_all(&dir);
     let socket = format!("{dir}/s");
     let started = Instant::now();

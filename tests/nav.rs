@@ -43,7 +43,7 @@ impl Server {
         static N: AtomicU32 = AtomicU32::new(0);
         let tmux = tmux_bin()?;
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(format!("/tmp/ta-{}-nav{n}", std::process::id()));
+        let dir = PathBuf::from(format!("{}/ta-{}-nav{n}", scratch(), std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("s").to_str().unwrap().to_owned();
         let s = Server { tmux, dir, socket };
@@ -607,4 +607,15 @@ fn pick_with_no_agents_says_so() {
     let c = s.wait_client(|f| f.contains("control-mode"));
     assert!(s.agent(&["pick", "--client", &c]).status.success());
     cc.wait_message(&s, &c, "tmux-agent: no agents");
+}
+
+/// Where tests put scratch dirs: /var/tmp, which is on disk, else /tmp (the
+/// Nix build sandbox has no /var/tmp). Short: a socket path holds at most
+/// 104 bytes.
+fn scratch() -> &'static str {
+    if std::path::Path::new("/var/tmp").is_dir() {
+        "/var/tmp"
+    } else {
+        "/tmp"
+    }
 }

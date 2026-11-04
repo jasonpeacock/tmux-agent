@@ -60,7 +60,11 @@ impl Server {
             return None;
         };
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from(format!("/tmp/ta-{}-{n}{suffix}", std::process::id()));
+        let dir = PathBuf::from(format!(
+            "{}/ta-{}-{n}{suffix}",
+            scratch(),
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("s").to_str().unwrap().to_owned();
         let s = Server {
@@ -617,4 +621,15 @@ fn missing_binary_stays_quiet() {
     std::thread::sleep(Duration::from_millis(500));
     let modes = s.tmux(&["list-panes", "-a", "-F", "#{pane_in_mode}"]);
     assert!(modes.lines().all(|m| m == "0"), "{modes}");
+}
+
+/// Where tests put scratch dirs: /var/tmp, which is on disk, else /tmp (the
+/// Nix build sandbox has no /var/tmp). Short: a socket path holds at most
+/// 104 bytes.
+fn scratch() -> &'static str {
+    if std::path::Path::new("/var/tmp").is_dir() {
+        "/var/tmp"
+    } else {
+        "/tmp"
+    }
 }

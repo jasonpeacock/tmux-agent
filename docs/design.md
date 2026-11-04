@@ -114,7 +114,7 @@ There are two parts:
 The plugin acts only when `session.start` reports `surface === 'terminal'` and `isInteractive`. Otherwise every hook only calls `next(e)`.
 
 - If `$.env.get('TMUX')` and `$.env.get('TMUX_PANE')` are both set, it reports for that pane (`--pane`, `--socket`). A malformed `TMUX` or pane id turns it off, and so does only one of the two being set.
-- If neither is set, it reports as an **attached** session (`--attached`, no pane): see Background sessions (claude attach). The binary keeps a record only for an engine that Claude's daemon hosts, and decides which panes, if any, show it.
+- If neither is set, it reports as an **attached** session (`--attached`, no pane): see Background sessions (claude attach). The binary keeps a record only for an engine that Claude's daemon hosts, and decides which panes, if any, show it. An attached report also carries `--claude-dir`: `$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, if absolute (see Fleet viewers).
 
 ### Hook discipline
 
@@ -176,6 +176,7 @@ These rules follow from the events Claude sends:
 | `claude -p` in a pane | Ignored: `isInteractive` is false. |
 | A nested interactive `claude` in a pane already owned | Its `claim` is refused while the owner lives (see Ownership). |
 | A background session (Claude's daemon) viewed with `claude attach` in a pane | Reported `--attached`. Shown on each pane that runs `claude attach` for it (see Background sessions). |
+| A background session viewed in the fleet view of the pane's own Claude, after the left-arrow handoff or `/fork` | Reported `--attached`. Shown on that pane while the pane title names it (see Fleet viewers). |
 | Other interactive agents outside tmux (a terminal, an IDE) | Reported `--attached` too, as the plugin cannot tell them apart. The binary ignores them: no daemon pty host is their parent, so they get no record and cost no `ps` call after that report. |
 
 ### Settings
@@ -251,7 +252,7 @@ claude daemon run --origin transient ...                      (ppid 1)
 pane %3: zsh → claude attach 686fd2bf → .../bin/claude attach 686fd2bf → .../claude attach 686fd2bf
 ```
 
-The engine has no `TMUX` or `TMUX_PANE`, and a terminal attach raises no `session.attach` event, so the plugin cannot know which pane shows it, or when that changes. The binary works it out instead.
+The engine has no `TMUX` or `TMUX_PANE`, and a terminal attach raises no `session.attach` event (that event is only for remote stream-json surfaces), so the plugin cannot know which pane shows it, or when that changes. The binary works it out instead.
 
 ```mermaid
 flowchart TB
@@ -272,7 +273,7 @@ flowchart TB
 - The session id is one of: the value after `--session-id` (or `--session-id=`) in P's argv, the id of P's live record, then `--session`. The first that some `claude attach` token names wins, else the first in that order. P's live record under another id is renamed to it. After `/clear` the reported id changes but the attach key does not; a spare engine has no `--session-id`, so its record keeps the id it first reported until a client names another. Its first eight characters are its **short id**.
 - The transition applies to the session's record, under the same ownership rules as a pane: the owner is the engine PID plus its start time.
 
-**Records.** `@agent_bg` holds one record per session, space-separated; each is `id|loop|asks|bg|pid|pid_start|since|session|proto|plugin`. Fields never hold a space, `|`, tab or newline. One global option rather than one per session, because it reads through the snapshot's existing `list-sessions` format, with no `show-options` output to parse and nothing to read when no records exist.
+**Records.** `@agent_bg` holds one record per session, space-separated; each is `id|loop|asks|bg|pid|pid_start|since|session|proto|plugin`, plus `|claude_dir` once the engine reported one. Fields never hold a space, `|`, tab or newline; the config dir is written with `%XX` for those and `%`. A record with no config dir keeps ten fields, so an older binary still reads it. One global option rather than one per session, because it reads through the snapshot's existing `list-sessions` format, with no `show-options` output to parse and nothing to read when no records exist.
 
 **Finding the panes.** One `ps -A -ww -o pid= -o ppid= -o args=` call (retried without `-ww` if `ps` rejects it, as BusyBox does), made only for `report --attached` or while a record exists:
 - A client is a process whose command is a word with the file name `claude`, and whose first non-option word after it (before any `--`) is `attach`, followed by a token. The command is argv0; or the script a launcher runs (`/bin/sh ./claude`, `node /usr/local/bin/claude`, `/usr/bin/env claude`); or, for an absolute argv0 path that holds spaces, such as `.../Application Support/...`, the word that ends it, within the first four words and with no option before it. That excludes `tmux attach`, `git attach`, `sh -c "claude attach …"` (its child is the client), wrappers named otherwise, and an engine whose arguments mention the words.
@@ -281,7 +282,7 @@ flowchart TB
 
 **Projection.** After every command, under the lock:
 1. Records whose owner is dead are deleted.
-2. Each pane that shows a session gets the record's state, with `@agent_pane_attached` set to the short id. A pane with a live session of its own (no marker) keeps it. A pane report on a pane that only shows a background session takes the pane.
+2. Each pane that shows a session gets the record's state, with `@agent_pane_attached` set to the short id. A pane with a live session of its own (no marker) keeps it, unless its owner is the fleet viewer that shows the session (see Fleet viewers). A pane report on a pane that only shows a background session takes the pane.
 3. A marked pane that no longer shows a session, or whose record is gone, is cleared.
 4. Rollups and the summary follow, as for any pane. A session attached in two panes counts in each pane's window, but once in the summary: the summary counts one per short id among marked panes.
 
@@ -298,6 +299,51 @@ flowchart TB
 - A token shorter than eight characters never matches.
 - A spare engine's attach key is assumed to be the first session id it reports, or one a client names; not checked against a live claimed spare.
 - With no working `ps`, no pane ever shows a background session. `doctor` warns when records exist and the scan fails.
+
+### Fleet viewers
+
+The left-arrow handoff on an empty prompt sends the session to the background, and `/fork` inside a background job forks it there too. Then the pane's own Claude process shows daemon jobs in its **fleet view**: a list of jobs, where Enter attaches to one and a left arrow detaches. No `claude attach` process runs. Seen live on Linux with Claude 2.1.316:
+
+```
+pane %25: fish → claude --resume → .../claude (P, the pane's owner: now the viewer)
+                                    └─ claude daemon run --origin transient --spawned-by {"pid":P}
+                                       ├─ claude bg-pty-host ... -- claude --session-id <a> --fork-session --resume <P's transcript>
+                                       │  └─ claude --session-id <a> ...   job engine: reports --attached
+                                       └─ claude bg-pty-host ... -- claude --bg-spare ...
+```
+
+P talks to the daemon over its control socket only. Its own session stops: its plugin gets no hook on handoff, attach, switch or detach, and gets `session.end` (reason `other`) only when the viewer quits. So the pane keeps the record of P's last turn, `idle`, while the job it shows works.
+
+The binary reads what Claude writes in the job engine's config dir: the `--claude-dir` its reports carry, kept in its record, since the viewer, the daemon and its jobs share one. A `reconcile` that tmux runs has the tmux server's environment, not Claude's. A record with no dir uses the binary's own (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). These are Claude internals with no documented format; any file that does not parse is ignored.
+- `daemon/attach-journal/<gesture>.json`, a telemetry beacon, exists while a viewer is attached to a job: `{"surface":"fleet","pid":P,"procStart":S,"startedAtEpochMs":T,...}`. It is written at attach and removed at detach. It does not say which job. S is field 22 of `/proc/P/stat` on Linux, the same as the owner start time. On macOS its format is unverified, so a live P that started before T is accepted there. A beacon left by a killed viewer fails the check and is ignored.
+- `sessions/<pid>.json`, one per Claude process, gives a job engine's `kind` (`bg`), `name` and `nameSource` (`user` or `auto`). An unnamed job has no `nameSource`, and its `name` is its job id. A spare has `spare: true`.
+- `#{pane_title}`: at attach the viewer sets the job's name; when the job's own title changes it becomes a status glyph, a space and the name. For a job with no name yet it is the start of the prompt, `claude` or `current session`. On the list it is `<n> awaiting input · claude agents`.
+
+Neither file names the job a viewer shows: `parkedJobId` in the viewer's registry file is set once, at the handoff, and does not follow a switch. Only the title does, once the job has a name.
+
+**Linking.** While a record exists, `reconcile` and `report --attached` (the `ps` path) read the beacon directory. For each live `fleet` beacon:
+1. The pane is the one whose `pane_pid` is P or an ancestor of P, as for a `claude attach` client.
+2. The job is the record whose engine's registry file has a `nameSource`, is not a spare, and whose `name` the pane title shows: the whole title, or the title after one non-alphanumeric glyph and a space. The file's `pid`, when present, must match the record's owner, and on Linux so must its `procStart`.
+3. If no record's name matches, or more than one does, nothing is linked. A wrong job is worse than none.
+
+A linked pane is projected as for a `claude attach` pane, except that the pane owner's own record gives way when the owner is P: while P views a job it runs no session of its own. A pane with `claude attach` wins over a beacon.
+
+**What shows.**
+
+| Viewer | Pane |
+|---|---|
+| on the fleet list, before any attach | P's own record, `idle` |
+| attached to a named job | the job's state, marked with its short id |
+| attached to an unnamed job, or one whose name another job shares | no job: P's own record if the pane showed no job before, else nothing |
+| switched to another job | that job's state within one status interval, once its title names it |
+| detached to the list | nothing |
+| quit | `release` clears the pane |
+
+**Cost.** With no records, nothing is read. Otherwise each `ps`-path command reads the beacon directory of each record's config dir (usually one) and its files (`report --attached` twice: once for focus, once to project), and while a live beacon exists, one small registry file per record. The title comes from the existing `list-panes` call: tmux drops control characters from titles, so it holds no tab.
+
+**Limits.**
+- An unnamed job shows nothing until it is named (Claude names one after its first turn, or `/rename` and Ctrl-R in the list).
+- Any Claude release may change these files.
 
 ## Display
 
@@ -388,7 +434,7 @@ Keys:
 | Command | Called by | Purpose |
 |---|---|---|
 | `init` | `tmux-agent.tmux` (`run-shell`) | Read the config in one call. In a second, set `focus-events on`, register the tmux hooks at a fixed index and publish `@agent_bin` and `@agent_version`. Then bind each key in its own call, then `reconcile`. A key failure does not skip `reconcile`. `reconcile` is skipped when no session exists, as while tmux.conf first loads. Idempotent on re-source. |
-| `report <event>` | Claude plugin | Events: `claim`, `reset`, `working`, `ask`, `resume`, `done`, `error`, `cancel`, `release`. Flags: `--proto`, `--pane` or `--attached`, `--socket`, `--pid`, `--session`, `--bg`, `--plugin-version`. |
+| `report <event>` | Claude plugin | Events: `claim`, `reset`, `working`, `ask`, `resume`, `done`, `error`, `cancel`, `release`. Flags: `--proto`, `--pane` or `--attached`, `--socket`, `--pid`, `--session`, `--bg`, `--plugin-version`, `--claude-dir`. |
 | `focus --pane` | the `pane-focus-in` hook | Apply `focus`, then `reconcile`. |
 | `reconcile` | hooks, status token, navigation | Clear dead state and recompute rollups and the summary. Prints nothing. |
 | `jump`, `pick` | key bindings | Navigation. |
@@ -471,6 +517,7 @@ src/tmux.rs        tmux lookup, batched calls, quoting
 src/lock.rs        socket lock, and the paths beside the socket
 src/owner.rs       PID liveness and start time
 src/attach.rs      background sessions: ps parsing, attach matching, daemon check (pure)
+src/fleet.rs       fleet viewers: Claude's attach beacons, job registry, title match
 src/config.rs
 src/init.rs  src/nav.rs  src/doctor.rs
 tests/             integration tests on private tmux servers
@@ -510,7 +557,7 @@ Dependencies: `libc` and `lexopt`. `list --json` output is written by hand.
     - a refused nested claim, and an ignored non-owner release;
     - concurrent reports;
     - seen on arrival;
-    - background sessions (`tests/attached.rs`): a fake `claude` client (a `#!/bin/sh` script, so its argv reads `/bin/sh ./claude attach <id>` with any `/bin/sh`, BusyBox included) and a fake engine with `--session-id` under a fake pty host whose argv holds `--bg-pty-host`, in its own process group so the test kills all of it. Report, detach, a second attach, a dead engine, a direct session that keeps its pane, focus across panes, a foreign spare engine refused, an engine no daemon hosts ignored, a server restart that restores the record from disk, and the default socket (with a recording tmux stand-in, never a real default server).
+    - background sessions (`tests/attached.rs`): a fake `claude` client (a `#!/bin/sh` script, so its argv reads `/bin/sh ./claude attach <id>` with any `/bin/sh`, BusyBox included) and a fake engine with `--session-id` under a fake pty host whose argv holds `--bg-pty-host`, in its own process group so the test kills all of it. Report, detach, a second attach, a dead engine, a direct session that keeps its pane, focus across panes, a foreign spare engine refused, an engine no daemon hosts ignored, a server restart that restores the record from disk, and the default socket (with a recording tmux stand-in, never a real default server). A fleet viewer: the pane's own process claims the pane and sets its title with an OSC sequence, and the test writes a beacon and a registry file into a scratch `CLAUDE_CONFIG_DIR` (every test gets one, so none reads the user's); attach, the job's states, and detach.
   - `TMUX_AGENT_SKIP_TMUX_TESTS` skips them where tmux is missing.
 - **Plugin tests**: `claude plugin test plugin/`, with the local event harness and no model calls.
   - Each test replays an event sequence and captures the argv through an `on('process.run', ...)` hook.

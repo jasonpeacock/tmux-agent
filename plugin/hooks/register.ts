@@ -20,7 +20,7 @@ const DIALOGS_DONE = ['elicitation_complete', 'elicitation_response']
 // Where reports go: the pane this session runs in, or, with no pane, a
 // session a background daemon runs and `claude attach` shows in some pane;
 // the binary finds those panes.
-type Target = { pid: string; pane?: { id: string; socket: string } }
+type Target = { pid: string; pane?: { id: string; socket: string }; claudeDir?: string }
 type Ask = { agent: string; tool: string; input: string; timer: { cancel: () => void } }
 
 // The session's state. A reload starts it over; the binary keeps what the
@@ -163,10 +163,21 @@ async function findTarget($: EngineInterface): Promise<Target | null> {
     // Claude process that owns this pane.
     const r = await $.process.run(['sh', '-c', 'echo $PPID'], { timeoutMs: 2000 })
     const pid = r.stdout.trim()
-    return /^\d+$/.test(pid) ? { pid, pane } : null
+    if (!/^\d+$/.test(pid)) return null
+    if (pane) return { pid, pane }
+    // A background engine's config dir holds its fleet viewers' beacons;
+    // the binary keeps it, as a reconcile that tmux runs has another
+    // environment.
+    const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || (await homeClaude($))
+    return { pid, claudeDir: dir?.startsWith('/') ? dir : undefined }
   } catch {
     return null
   }
+}
+
+async function homeClaude($: EngineInterface): Promise<string | undefined> {
+  const home = await $.env.get('HOME')
+  return home ? `${home.replace(/\/+$/, '')}/.claude` : undefined
 }
 
 // Queues a report. Returns the chain, which only session.end awaits.
@@ -176,7 +187,9 @@ function report($: EngineInterface, event: string, extra: string[] = []): Promis
     .then(async t => {
       if (!t) return
       const session = await $.session.id().catch(() => '')
-      const where = t.pane ? ['--pane', t.pane.id, '--socket', t.pane.socket] : ['--attached']
+      const where = t.pane
+        ? ['--pane', t.pane.id, '--socket', t.pane.socket]
+        : ['--attached', ...(t.claudeDir ? ['--claude-dir', t.claudeDir] : [])]
       // The event comes first: an older binary skips flags it does not know.
       await $.process.run(
         [s.bin, 'report', event, ...where, '--pid', t.pid,

@@ -2,6 +2,7 @@
 //! back only what changed.
 
 use crate::attach::{self, Procs};
+use crate::fleet;
 use crate::lock::{self, Lock};
 use crate::owner;
 use crate::snapshot::{self, Bg, Rec, Snapshot};
@@ -9,7 +10,7 @@ use crate::state::{self, Display, Event, Summary};
 use crate::tmux::{Cmds, Tmux};
 use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A report from the Claude plugin.
@@ -26,6 +27,9 @@ pub struct Report {
     pub bg: u32,
     pub proto: Option<String>,
     pub plugin: Option<String>,
+    /// A background engine's Claude config dir (`--claude-dir`): where its
+    /// fleet viewers' beacons and its registry file are. An absolute path.
+    pub claude_dir: Option<String>,
 }
 
 impl Report {
@@ -253,10 +257,20 @@ fn apply_attached(snap: &mut Snapshot, r: &Report, ev: Event, procs: &mut Procs)
                 snap.bg.remove(i);
             }
         }
-        Outcome::Set(rec) => match i {
-            Some(i) => snap.bg[i].rec = rec,
-            None => snap.bg.push(Bg { id, rec }),
-        },
+        Outcome::Set(rec) => {
+            let i = i.unwrap_or_else(|| {
+                snap.bg.push(Bg {
+                    id,
+                    rec: rec.clone(),
+                    claude: String::new(),
+                });
+                snap.bg.len() - 1
+            });
+            snap.bg[i].rec = rec;
+            if let Some(d) = r.claude_dir.as_ref().filter(|d| d.starts_with('/')) {
+                snap.bg[i].claude.clone_from(d);
+            }
+        }
     }
 }
 
@@ -310,9 +324,10 @@ fn session_of(snap: &mut Snapshot, r: &Report, procs: &mut Procs) -> Option<Stri
     Some(id)
 }
 
-/// The panes that show session `id` now, from the process table.
+/// The panes that show session `id` now, from the process table and the
+/// fleet viewers' beacons.
 fn panes_showing(snap: &Snapshot, id: &str, procs: &mut Procs) -> Vec<String> {
-    procs
+    let mut out: Vec<String> = procs
         .get()
         .map(|rows| {
             attach::attachments(rows, &pane_pids(snap), &[id])
@@ -320,7 +335,79 @@ fn panes_showing(snap: &Snapshot, id: &str, procs: &mut Procs) -> Vec<String> {
                 .map(|(p, _)| p)
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    out.extend(
+        fleet_links(snap, procs)
+            .into_iter()
+            .filter(|(_, i, _)| i == id)
+            .map(|(p, _, _)| p),
+    );
+    out
+}
+
+/// (pane, session id, viewer PID) for each pane whose Claude process shows a
+/// background session in its own terminal, in the fleet view: a live
+/// `fleet` beacon, the pane whose `pane_pid` is the viewer or an ancestor,
+/// and the one record whose job name the pane title shows. A title that
+/// names no record, or more than one, links nothing: the viewer's beacon
+/// does not say which job it shows. See docs/design.md, "Fleet viewers".
+fn fleet_links(snap: &Snapshot, procs: &mut Procs) -> Vec<(String, String, u32)> {
+    if snap.bg.is_empty() {
+        return Vec::new();
+    }
+    // Each record's config dir is the one its engine reported, else ours.
+    let fallback = procs.claude_dir().map(Path::to_path_buf);
+    let dir_of = |b: &Bg| -> Option<PathBuf> {
+        if b.claude.is_empty() {
+            fallback.clone()
+        } else {
+            Some(PathBuf::from(&b.claude))
+        }
+    };
+    let mut dirs: Vec<PathBuf> = snap.bg.iter().filter_map(dir_of).collect();
+    dirs.sort();
+    dirs.dedup();
+    let viewers: Vec<(&PathBuf, u32)> = dirs
+        .iter()
+        .flat_map(|d| fleet::viewers(d).into_iter().map(move |v| (d, v)))
+        .collect();
+    if viewers.is_empty() {
+        return Vec::new();
+    }
+    let Some(rows) = procs.get() else {
+        return Vec::new();
+    };
+    let names: Vec<(&str, &PathBuf, String)> = snap
+        .bg
+        .iter()
+        .filter_map(|b| {
+            let d = dirs.iter().find(|d| Some(*d) == dir_of(b).as_ref())?;
+            Some((
+                b.id.as_str(),
+                d,
+                fleet::job_name(d, b.rec.pid, &b.rec.start)?,
+            ))
+        })
+        .collect();
+    let pids = pane_pids(snap);
+    let mut out: Vec<(String, String, u32)> = Vec::new();
+    for (dir, v) in viewers {
+        let Some(pane) = attach::pane_of(rows, &pids, v) else {
+            continue;
+        };
+        let Some(title) = snap.panes.iter().find(|p| p.id == pane).map(|p| &p.title) else {
+            continue;
+        };
+        let mut named = names
+            .iter()
+            .filter(|(_, d, n)| *d == dir && fleet::titled(title, n));
+        if let (Some((id, _, _)), None) = (named.next(), named.next())
+            && !out.iter().any(|(p, _, _)| p == pane)
+        {
+            out.push((pane.to_owned(), (*id).to_owned(), v));
+        }
+    }
+    out
 }
 
 fn pane_pids(snap: &Snapshot) -> Vec<(u32, &str)> {
@@ -375,44 +462,62 @@ fn sync(snap: &mut Snapshot, find: Find, procs: &mut Procs, now: u64) {
             b.rec.since = now;
         }
     }
-    let shown = shown(snap, find, procs);
-    project(snap, &shown);
+    let (shown, viewers) = shown(snap, find, procs);
+    project(snap, &shown, &viewers);
     gc(snap);
 }
 
-/// (pane, session id) for each pane that shows a background session.
-fn shown(snap: &Snapshot, find: Find, procs: &mut Procs) -> Vec<(String, String)> {
+/// (pane, session id) for each pane that shows a background session, and
+/// (pane, viewer PID) for those that show one in the fleet view.
+type Shown = (Vec<(String, String)>, Vec<(String, u32)>);
+
+fn shown(snap: &Snapshot, find: Find, procs: &mut Procs) -> Shown {
     if snap.bg.is_empty() {
-        return Vec::new();
+        return Default::default();
     }
     if find == Find::Ps
         && let Some(rows) = procs.get()
     {
         let ids: Vec<&str> = snap.bg.iter().map(|b| b.id.as_str()).collect();
-        return attach::attachments(rows, &pane_pids(snap), &ids);
+        let mut shown = attach::attachments(rows, &pane_pids(snap), &ids);
+        let mut viewers = Vec::new();
+        for (pane, id, v) in fleet_links(snap, procs) {
+            if !shown.iter().any(|(p, _)| *p == pane) {
+                viewers.push((pane.clone(), v));
+                shown.push((pane, id));
+            }
+        }
+        return (shown, viewers);
     }
-    marked(snap)
+    let shown = marked(snap)
         .into_iter()
         .filter_map(|(p, m)| {
             let b = snap.bg.iter().find(|b| attach::short(&b.id) == m)?;
             Some((p, b.id.clone()))
         })
-        .collect()
+        .collect();
+    (shown, Vec::new())
 }
 
 /// Copies each background record onto the panes that show it, and clears
 /// panes that show a session no longer. A pane where a live session runs
-/// directly keeps that session's state.
-fn project(snap: &mut Snapshot, shown: &[(String, String)]) {
+/// directly keeps that session's state, unless its Claude process is the
+/// fleet viewer that shows the background session: that process runs no
+/// session of its own while it views one.
+fn project(snap: &mut Snapshot, shown: &[(String, String)], viewers: &[(String, u32)]) {
     for p in &mut snap.panes {
         let bg = shown
             .iter()
             .find(|(pane, _)| *pane == p.id)
             .and_then(|(_, id)| snap.bg.iter().find(|b| b.id == *id));
+        let viewer = viewers.iter().find(|(pane, _)| *pane == p.id).map(|v| v.1);
         match bg {
             Some(b) => {
                 let direct = p.rec.as_ref().is_some_and(|r| {
-                    r.attached.is_empty() && r.pid != 0 && owner::alive(r.pid, &r.start)
+                    r.attached.is_empty()
+                        && r.pid != 0
+                        && viewer != Some(r.pid)
+                        && owner::alive(r.pid, &r.start)
                 });
                 if !direct {
                     p.rec = Some(Rec {
@@ -698,6 +803,7 @@ mod tests {
             pane_index: "1".into(),
             window_name: "w".into(),
             path: "/".into(),
+            title: String::new(),
             orig: None,
             rec: None,
             win_state: String::new(),
@@ -1310,6 +1416,7 @@ mod tests {
                 start: owner::start_time(me()).unwrap(),
                 ..rec(Loop::Done)
             },
+            claude: String::new(),
         });
         run(&mut s, &rows, &bg_report("working", me()));
         assert_eq!(s.bg.len(), 1);
@@ -1344,6 +1451,7 @@ mod tests {
         other.bg_orig.push(Bg {
             id: "x".into(),
             rec: rec(Loop::Idle),
+            claude: String::new(),
         });
         other.bg_restored = false;
         let before = other.bg.clone();
@@ -1376,6 +1484,231 @@ mod tests {
             plugin: String::new(),
             attached: String::new(),
         }
+    }
+
+    const JOB_A: &str = "661643ba-6033-443c-b94d-2f8b6eaad572";
+    const JOB_B: &str = "c0e1afb8-8cc7-40ea-8724-4d28b0609c2d";
+
+    /// A scratch Claude config dir, removed on drop.
+    struct Claude(std::path::PathBuf);
+
+    impl Claude {
+        fn new(tag: &str) -> Claude {
+            let d = std::path::PathBuf::from(format!(
+                "{}/tmux-agent-engine-{}-{tag}",
+                crate::fleet::tests::scratch(),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(d.join("daemon/attach-journal")).unwrap();
+            std::fs::create_dir_all(d.join("sessions")).unwrap();
+            Claude(d)
+        }
+
+        /// The beacon a fleet viewer writes while attached to a job.
+        fn attach(&self, viewer: u32) {
+            let start = owner::start_time(viewer).unwrap();
+            std::fs::write(
+                self.0.join("daemon/attach-journal/fd36231f.json"),
+                format!(
+                    "{{\"gestureId\":\"fd36231f\",\"surface\":\"fleet\",\
+                     \"startedAtEpochMs\":1793762110121,\"attempt\":1,\"pid\":{viewer},\
+                     \"procStart\":\"{start}\",\"via\":\"cold\"}}"
+                ),
+            )
+            .unwrap();
+        }
+
+        fn detach(&self) {
+            std::fs::remove_file(self.0.join("daemon/attach-journal/fd36231f.json")).unwrap();
+        }
+
+        /// A job engine's registry file.
+        fn job(&self, pid: u32, id: &str, name: &str, source: Option<&str>) {
+            let source = source.map_or(String::new(), |s| format!(",\"nameSource\":\"{s}\""));
+            std::fs::write(
+                self.0.join(format!("sessions/{pid}.json")),
+                format!(
+                    "{{\"pid\":{pid},\"sessionId\":\"{id}\",\"kind\":\"bg\",\
+                     \"name\":\"{name}\",\"jobId\":\"{}\"{source}}}",
+                    attach::short(id)
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for Claude {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The Linux tree seen live after the left-arrow handoff: pane %1 (pane
+    /// pid 100) runs Claude `viewer`, whose child daemon hosts job engines
+    /// `a` and `b` and a spare. %2 runs a shell.
+    fn fleet_world(viewer: u32, a: u32, b: u32) -> (Snapshot, Vec<attach::PsRow>) {
+        let mut panes = vec![pane("%1", "@1"), pane("%2", "@2")];
+        panes[0].pid = 100;
+        panes[1].pid = 200;
+        panes[0].rec = Some(Rec {
+            pid: viewer,
+            session: "88b94a2c-aaa0-4ffb-8521-67338d78d6ff".into(),
+            ..rec(Loop::Idle)
+        });
+        let rows = attach::parse_ps(&format!(
+            "100 1 -fish\n\
+             {viewer} 100 /opt/cc/claude --settings {{\"a\":1}}\n\
+             80 {viewer} /opt/cc/claude daemon run --origin transient \
+             --spawned-by {{\"label\":\"claude\",\"cwd\":\"/a b\",\"pid\":{viewer}}}\n\
+             91 80 claude bg-pty-host --bg-pty-host /x/pty/661643ba.sock 1 1 -- /opt/cc/claude\n\
+             {a} 91 /opt/cc/claude --session-id {JOB_A} --fork-session --resume /p/88b94a2c.jsonl\n\
+             92 80 claude bg-pty-host --bg-pty-host /x/spare/1.pty.sock 1 1 -- /opt/cc/claude\n\
+             {b} 92 claude bg-spare --bg-spare /x/spare/1.claim.sock\n\
+             200 1 /bin/sh\n"
+        ));
+        (snap(panes), rows)
+    }
+
+    fn fleet_run(s: &mut Snapshot, rows: &[attach::PsRow], dir: &Claude, r: Option<&Report>) {
+        let mut procs = Procs::fixed(rows.to_vec()).with_claude(&dir.0);
+        if let Some(r) = r {
+            apply_report(s, r, &mut procs);
+        }
+        sync(s, Find::Ps, &mut procs, 50);
+    }
+
+    #[test]
+    fn a_fleet_viewer_shows_the_job_its_title_names() {
+        let viewer = Proc::spawn();
+        let b = Proc::spawn();
+        let (mut s, rows) = fleet_world(viewer.pid(), me(), b.pid());
+        let dir = Claude::new("fleet");
+        dir.job(me(), JOB_A, "krate-paa-docs", Some("user"));
+        dir.job(b.pid(), JOB_B, "krate-paa (3) ⑂", Some("auto"));
+        let mut bg_b = bg_report("done", b.pid());
+        bg_b.session = Some(JOB_B.into());
+        fleet_run(&mut s, &rows, &dir, Some(&bg_b));
+        assert_eq!(s.bg.len(), 1);
+
+        // At the fleet list there is no beacon: the pane keeps its own record.
+        s.pane_mut("%1").unwrap().title = "1 awaiting input · claude agents".into();
+        fleet_run(&mut s, &rows, &dir, Some(&bg_report("working", me())));
+        assert_eq!(st(&s, "%1").unwrap().lp, Loop::Idle);
+        assert_eq!(marker(&s, "%1").as_deref(), Some(""));
+        assert_eq!(s.bg.len(), 2);
+
+        // Attached to job A: the viewer sets the bare name, then the job's
+        // own title follows with a glyph.
+        dir.attach(viewer.pid());
+        for title in ["krate-paa-docs", "✳ krate-paa-docs"] {
+            s.pane_mut("%1").unwrap().title = title.into();
+            fleet_run(&mut s, &rows, &dir, None);
+            assert_eq!(st(&s, "%1").unwrap().lp, Loop::Working, "{title}");
+            assert_eq!(marker(&s, "%1").as_deref(), Some("661643ba"), "{title}");
+        }
+        assert_eq!(st(&s, "%2"), None);
+        assert!(
+            plan(&s, 50).args().join(" ").contains("@agent_summary W 1"),
+            "the viewer's own session is not counted as well"
+        );
+
+        // An unchanged reconcile writes nothing.
+        let mut s = written_as_read(&s, &plan(&s, 50).args().join(" "));
+        fleet_run(&mut s, &rows, &dir, None);
+        assert!(plan(&s, 50).is_empty(), "{:?}", plan(&s, 50).args());
+
+        // A switch to job B follows the title.
+        s.pane_mut("%1").unwrap().title = "⠂ krate-paa (3) ⑂".into();
+        fleet_run(&mut s, &rows, &dir, None);
+        assert_eq!(marker(&s, "%1").as_deref(), Some("c0e1afb8"));
+        assert_eq!(st(&s, "%1").unwrap().lp, Loop::Done);
+
+        // A title that names no job, or two, links nothing.
+        for (title, other) in [
+            ("current session", "x"),
+            ("✳ krate-paa-docs", "krate-paa-docs"),
+        ] {
+            dir.job(b.pid(), JOB_B, other, Some("auto"));
+            s.pane_mut("%1").unwrap().title = title.into();
+            fleet_run(&mut s, &rows, &dir, None);
+            assert_eq!(s.pane("%1").unwrap().rec, None, "{title}");
+        }
+
+        // An unnamed job's registry name is its id: never matched.
+        dir.job(b.pid(), JOB_B, "c0e1afb8", None);
+        s.pane_mut("%1").unwrap().title = "c0e1afb8".into();
+        fleet_run(&mut s, &rows, &dir, None);
+        assert_eq!(s.pane("%1").unwrap().rec, None);
+
+        // Detach: the beacon goes, and so does the link.
+        s.pane_mut("%1").unwrap().title = "krate-paa-docs".into();
+        fleet_run(&mut s, &rows, &dir, None);
+        assert_eq!(marker(&s, "%1").as_deref(), Some("661643ba"));
+        dir.detach();
+        fleet_run(&mut s, &rows, &dir, None);
+        assert_eq!(s.pane("%1").unwrap().rec, None);
+    }
+
+    #[test]
+    fn the_config_dir_comes_from_the_engine_report() {
+        let viewer = Proc::spawn();
+        let (mut s, rows) = fleet_world(viewer.pid(), me(), 1);
+        let dir = Claude::new("reported");
+        dir.job(me(), JOB_A, "krate-paa-docs", Some("user"));
+        dir.attach(viewer.pid());
+        s.pane_mut("%1").unwrap().title = "✳ krate-paa-docs".into();
+        // This command has no config dir of its own, as a reconcile that
+        // tmux runs with another environment.
+        let cmd = |s: &mut Snapshot, r: Option<&Report>| {
+            let mut procs = Procs::fixed(rows.clone());
+            if let Some(r) = r {
+                apply_report(s, r, &mut procs);
+            }
+            sync(s, Find::Ps, &mut procs, 50);
+        };
+        cmd(&mut s, Some(&bg_report("working", me())));
+        assert_eq!(marker(&s, "%1").as_deref(), Some(""), "no dir: no link");
+
+        let mut r = bg_report("working", me());
+        r.claude_dir = Some(dir.0.to_str().unwrap().to_owned());
+        cmd(&mut s, Some(&r));
+        assert_eq!(s.bg[0].claude, r.claude_dir.clone().unwrap());
+        assert_eq!(marker(&s, "%1").as_deref(), Some("661643ba"));
+
+        // Kept by later reports without it, and by a relative one.
+        let mut r = bg_report("done", me());
+        r.claude_dir = Some("rel".into());
+        cmd(&mut s, Some(&r));
+        cmd(&mut s, None);
+        assert_eq!(s.bg[0].claude, dir.0.to_str().unwrap());
+        assert_eq!(st(&s, "%1").unwrap().lp, Loop::Done);
+    }
+
+    #[test]
+    fn a_dead_viewer_beacon_links_nothing() {
+        let mut viewer = Proc::spawn();
+        let (mut s, rows) = fleet_world(viewer.pid(), me(), 1);
+        let dir = Claude::new("dead");
+        dir.job(me(), JOB_A, "krate-paa-docs", Some("user"));
+        dir.attach(viewer.pid());
+        s.pane_mut("%1").unwrap().title = "✳ krate-paa-docs".into();
+        // A beacon from a viewer that is not the pane's owner, e.g. a
+        // reused PID, still links, but the pane's own live owner keeps it.
+        let other = Proc::spawn();
+        s.pane_mut("%1").unwrap().rec.as_mut().unwrap().pid = other.pid();
+        fleet_run(&mut s, &rows, &dir, Some(&bg_report("working", me())));
+        assert_eq!(
+            marker(&s, "%1").as_deref(),
+            Some(""),
+            "the live owner keeps the pane"
+        );
+
+        // Killed while attached: Claude leaves the beacon behind.
+        viewer.kill();
+        s.pane_mut("%1").unwrap().rec = None;
+        fleet_run(&mut s, &rows, &dir, None);
+        assert_eq!(s.pane("%1").unwrap().rec, None);
     }
 
     /// A live process other than the test, killed on drop.

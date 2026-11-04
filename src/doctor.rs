@@ -1344,6 +1344,7 @@ mod tests {
             pane_index: "0".into(),
             window_name: "w".into(),
             path: "/".into(),
+            title: String::new(),
             orig: rec.clone(),
             rec,
             win_state: String::new(),
@@ -1433,6 +1434,7 @@ mod tests {
         s.bg.push(Bg {
             id: "686fd2bf-cb86".into(),
             rec: live_rec(),
+            claude: String::new(),
         });
         let pid = std::process::id();
         let c = pane_checks(Some(&s), 142);
@@ -1510,6 +1512,7 @@ mod tests {
         b.bg.push(Bg {
             id: "x".into(),
             rec: live_rec(),
+            claude: String::new(),
         });
         assert!(fingerprint(Some(&a)) != fingerprint(Some(&b)));
         assert!(fingerprint(Some(&a)) != fingerprint(None));
