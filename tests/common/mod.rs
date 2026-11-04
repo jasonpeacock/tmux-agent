@@ -144,6 +144,41 @@ impl Server {
         c
     }
 
+    /// Kills the server and starts a fresh one on the same socket.
+    /// `kill-server` returns before the old server has exited, and a client
+    /// that reaches it then fails with "server exited unexpectedly": wait
+    /// until it no longer answers.
+    pub fn restart(&self) {
+        self.tmux(&["kill-server"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self
+            .cmd()
+            .arg("list-sessions")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "old tmux server did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The socket may linger briefly after the server stops answering.
+        for _ in 0..50 {
+            let out = self
+                .cmd()
+                .args(["new-session", "-d", "-s", "main", "-x", "200", "-y", "50"])
+                .output()
+                .unwrap();
+            if out.status.success() {
+                self.tmux(&["set", "-g", "focus-events", "on"]);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("could not start a new tmux server on {}", self.socket);
+    }
+
     /// Runs one tmux command and returns its stdout, trimmed of the final
     /// newline. Panics when tmux fails.
     pub fn tmux(&self, args: &[&str]) -> String {

@@ -379,8 +379,7 @@ fn a_server_restart_keeps_background_sessions() {
     assert_eq!(state(&s, &a), "done");
     let since = s.pane_opt(&a, "@agent_pane_since");
 
-    s.tmux(&["kill-server"]);
-    s.tmux(&["new-session", "-d", "-s", "main", "-x", "200", "-y", "50"]);
+    s.restart();
     let b = attach_window(&s, e.short());
     assert_eq!(bg_opt(&s), "", "a new server starts empty");
     s.reconcile();
@@ -391,8 +390,7 @@ fn a_server_restart_keeps_background_sessions() {
 
     // Released, the copy on disk goes too: the next server restores nothing.
     bg_report(&s, "release", &e, &[]);
-    s.tmux(&["kill-server"]);
-    s.tmux(&["new-session", "-d", "-s", "main", "-x", "200", "-y", "50"]);
+    s.restart();
     let c = attach_window(&s, e.short());
     s.reconcile();
     assert_eq!(state(&s, &c), "");

@@ -416,6 +416,19 @@ fn list_with_no_agents_succeeds() {
 fn no_server_fails_list_but_not_jump_or_pick() {
     let Some(s) = Server::new() else { return };
     s.tmux(&["kill-server"]);
+    // kill-server returns before the server has exited.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while s
+        .tmux_cmd(&["list-sessions"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tmux server did not exit"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     assert!(!s.agent(&["list"]).status.success());
     for cmd in ["jump", "pick"] {
         let out = s.agent(&[cmd, "--client", "nobody"]);
