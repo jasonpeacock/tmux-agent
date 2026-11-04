@@ -2,6 +2,7 @@
 //!
 //! See docs/design.md, "Binary commands".
 
+mod attach;
 mod doctor;
 mod engine;
 mod init;
@@ -91,6 +92,7 @@ fn parse(mut parser: lexopt::Parser, first_value_is_event: bool) -> Result<Args,
         match arg {
             Long("socket") => a.socket = Some(parser.value()?.string()?),
             Long("pane") => a.report.pane = parser.value()?.string()?,
+            Long("attached") => a.report.attached = true,
             Long("pid") => a.report.pid = parser.value()?.string()?.parse().ok(),
             Long("session") => a.report.session = Some(parser.value()?.string()?),
             Long("bg") => a.report.bg = parser.value()?.string()?.parse().unwrap_or(0),
@@ -114,7 +116,15 @@ fn parse(mut parser: lexopt::Parser, first_value_is_event: bool) -> Result<Args,
 
 fn quiet(cmd: &str, parser: lexopt::Parser) -> Result<(), Box<dyn std::error::Error>> {
     let a = parse(parser, cmd == "report")?;
-    let Some(tmux) = Tmux::new(a.socket) else {
+    // A background session's engine runs outside tmux: with no --socket and
+    // no $TMUX, it reports to the default server.
+    let socket = match a.socket {
+        None if cmd == "report" && a.report.attached && a.report.pane.is_empty() => {
+            tmux::socket_or_default()
+        }
+        s => s,
+    };
+    let Some(tmux) = Tmux::new(socket) else {
         return Ok(());
     };
     match cmd {

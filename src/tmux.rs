@@ -11,7 +11,7 @@ pub struct Tmux {
     pub bin: PathBuf,
     /// The server socket, passed to every call as `-S`.
     pub socket: String,
-    /// Whether this tmux prints `$` as `\$` in command output (3.4 only),
+    /// Whether the server prints `$` as `\$` in command output (3.4 only),
     /// checked the first time output holds `\$`.
     escapes_dollar: OnceCell<bool>,
 }
@@ -50,11 +50,17 @@ impl Tmux {
         Ok(out)
     }
 
+    /// The server escapes, so its version counts, not this client's: a
+    /// background engine's report finds tmux on PATH, which may differ.
     fn is_3_4(&self) -> bool {
         Command::new(&self.bin)
-            .arg("-V")
+            .arg("-S")
+            .arg(&self.socket)
+            .args(["display-message", "-p", "#{version}"])
             .output()
-            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim_end() == "tmux 3.4")
+            .is_ok_and(|o| {
+                o.status.success() && String::from_utf8_lossy(&o.stdout).trim_end() == "3.4"
+            })
     }
 }
 
@@ -102,6 +108,36 @@ pub fn socket_from_env(tmux: &str) -> Option<String> {
     let (rest, _) = tmux.rsplit_once(',')?;
     let (socket, _) = rest.rsplit_once(',')?;
     (!socket.is_empty()).then(|| socket.to_owned())
+}
+
+/// The server in `$TMUX`, else tmux's default server.
+pub fn socket_or_default() -> Option<String> {
+    env::var("TMUX")
+        .ok()
+        .as_deref()
+        .and_then(socket_from_env)
+        .or_else(|| default_socket(env::var_os("TMUX_TMPDIR"), uid()))
+}
+
+/// The socket tmux uses with no `-L` or `-S`, as tmux works it out: the
+/// first of `$TMUX_TMPDIR` and `/tmp` that `realpath` resolves (on macOS
+/// `/tmp` is `/private/tmp`), then `tmux-<uid>/default`, not resolved again.
+pub fn default_socket(tmpdir: Option<OsString>, uid: u32) -> Option<String> {
+    let dir = tmpdir
+        .filter(|d| !d.is_empty())
+        .and_then(|d| std::fs::canonicalize(d).ok())
+        .or_else(|| std::fs::canonicalize("/tmp").ok())
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    dir.join(format!("tmux-{uid}"))
+        .join("default")
+        .into_os_string()
+        .into_string()
+        .ok()
+}
+
+fn uid() -> u32 {
+    // SAFETY: getuid cannot fail.
+    unsafe { libc::getuid() }
 }
 
 fn server_pid_from_env(tmux: &str) -> Option<u32> {
@@ -205,6 +241,32 @@ mod tests {
         );
         assert_eq!(socket_from_env("garbage"), None);
         assert_eq!(socket_from_env(",1,2"), None);
+    }
+
+    #[test]
+    fn default_socket_follows_tmux() {
+        let d = std::env::temp_dir().join(format!("ta-sock-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(d.join("tmux-7"));
+        let real = std::fs::canonicalize(&d).unwrap();
+        let want = real.join("tmux-7/default").to_str().unwrap().to_owned();
+        assert_eq!(default_socket(Some(d.clone().into()), 7), Some(want));
+        // tmux-<uid> need not exist yet: the server makes it.
+        assert_eq!(
+            default_socket(Some(d.clone().into()), 8).unwrap(),
+            real.join("tmux-8/default").to_str().unwrap()
+        );
+        // A $TMUX_TMPDIR that does not resolve, or an empty one, falls back
+        // to /tmp, as tmux does.
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
+        let want = tmp.join("tmux-7/default").to_str().unwrap().to_owned();
+        assert_eq!(
+            default_socket(Some(d.join("nope").into()), 7),
+            Some(want.clone())
+        );
+        assert_eq!(default_socket(Some(OsString::new()), 7), Some(want.clone()));
+        assert_eq!(default_socket(None, 7), Some(want));
+        let _ = std::fs::remove_dir(d.join("tmux-7"));
+        let _ = std::fs::remove_dir(&d);
     }
 
     #[test]

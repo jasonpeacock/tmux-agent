@@ -2,6 +2,7 @@
   lib,
   rustPlatform,
   tmux,
+  ps,
 }:
 let
   cargo = lib.importTOML ../Cargo.toml;
@@ -21,8 +22,12 @@ rustPlatform.buildRustPackage {
   };
   cargoLock.lockFile = ../Cargo.lock;
 
-  # Integration tests run private tmux servers.
-  nativeCheckInputs = [ tmux ];
+  # Integration tests run private tmux servers; the background-session tests
+  # read the process table, which the Linux build sandbox has no ps for.
+  nativeCheckInputs = [
+    tmux
+    ps
+  ];
   __darwinAllowLocalNetworking = true;
 
   meta = {

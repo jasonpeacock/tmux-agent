@@ -375,13 +375,16 @@ fn list_ranks_agent_panes() {
     let name = s.tmux(&["display-message", "-p", "-t", "b:0", "#{window_name}"]);
     let name = name.trim_end_matches('\n');
     assert!(name.starts_with("q\"b\\"));
-    assert_eq!(rows[0][5], name);
+    assert_eq!(rows[0][6], name);
     assert_eq!(rows[2][1..2], ["a:1.0"]);
-    assert_eq!(rows[2][5], "one");
+    assert_eq!(rows[2][6], "one");
     assert!(rows[2][3].parse::<u64>().unwrap() > 1_000_000, "since 50");
     assert!(rows[3][3].parse::<u64>().unwrap() < 60);
     assert_eq!(rows[3][4], "0");
-    assert!(rows.iter().all(|r| r.len() == 7 && !r[6].is_empty()));
+    assert!(
+        rows.iter()
+            .all(|r| r.len() == 8 && r[5] == "-" && !r[7].is_empty())
+    );
 
     let out = s.agent(&["list", "--json"]);
     assert!(out.status.success());
@@ -391,7 +394,9 @@ fn list_ranks_agent_panes() {
         want[0]
     )));
     let name = name.replace('\\', r"\\").replace('"', r#"\""#);
-    assert!(json.contains(&format!(r#""bg":0,"window":"{name}","cwd":""#)));
+    assert!(json.contains(&format!(
+        r#""bg":0,"attached":null,"window":"{name}","cwd":""#
+    )));
     assert_eq!(json.matches("\"pane_id\"").count(), 5);
     assert!(json.ends_with("}]\n"));
 }

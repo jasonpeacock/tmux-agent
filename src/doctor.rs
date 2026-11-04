@@ -4,10 +4,11 @@
 //! per-key `list-keys` calls (a failing call fails that check alone), and
 //! agent panes from a snapshot read before `reconcile`, so stale state shows.
 
+use crate::attach;
 use crate::engine;
 use crate::init::{FOCUS_HOOKS, HOOK_INDEX, KEY_NOTE_PREFIX, RECONCILE_HOOKS};
 use crate::owner;
-use crate::snapshot::{Rec, Snapshot};
+use crate::snapshot::{Bg, Rec, Snapshot};
 use crate::tmux::{Cmds, Tmux};
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -754,17 +755,34 @@ fn agent_checks(tmux: &Tmux) -> Vec<Check> {
     };
     let mut out = pane_checks(before.as_ref(), now());
     out.extend(orphan_checks(before.as_ref()));
-    match engine::reconcile(tmux).and_then(|()| Snapshot::read(tmux)) {
+    let after = engine::reconcile(tmux).and_then(|()| Snapshot::read(tmux));
+    match &after {
         Ok(after) if fingerprint(before.as_ref()) != fingerprint(after.as_ref()) => {
             out.push(check(Level::Ok, "reconciled: stale agent state cleared"));
         }
         Ok(_) => {}
         Err(e) => out.push(check(Level::Warn, format!("cannot reconcile: {e}"))),
     }
+    let has_bg = |s: Option<&Snapshot>| s.is_some_and(|s| !s.bg.is_empty());
+    let after = after.ok().flatten();
+    if (has_bg(before.as_ref()) || has_bg(after.as_ref())) && !attach::scan_works() {
+        out.push(
+            check(
+                Level::Warn,
+                "cannot list processes with `ps -A -o pid= -o ppid= -o args=`: \
+                 background sessions show on no pane",
+            )
+            .hint("install a ps that takes -o, e.g. procps"),
+        );
+    }
     out
 }
 
-type Print<'a> = (Vec<(&'a str, &'a Option<Rec>, [&'a str; 3])>, &'a str);
+type Print<'a> = (
+    Vec<(&'a str, &'a Option<Rec>, [&'a str; 3])>,
+    &'a str,
+    &'a [Bg],
+);
 
 /// The agent state `reconcile` may change: pane records, window options and
 /// the summary.
@@ -785,22 +803,28 @@ fn fingerprint(snap: Option<&Snapshot>) -> Option<Print<'_>> {
             )
         })
         .collect();
-    Some((panes, s.global.summary.as_str()))
+    Some((panes, s.global.summary.as_str(), &s.bg))
+}
+
+/// "owner 42 alive"; a dead owner is stale.
+fn owner_text(r: &Rec, level: &mut Level) -> String {
+    if r.pid == 0 {
+        "no owner pid".to_owned()
+    } else if owner::alive(r.pid, &r.start) {
+        format!("owner {} alive", r.pid)
+    } else {
+        *level = Level::Warn;
+        format!("owner {} dead (stale)", r.pid)
+    }
 }
 
 fn pane_checks(snap: Option<&Snapshot>, now: u64) -> Vec<Check> {
     let mut out = Vec::new();
-    for p in snap.map(|s| s.panes.as_slice()).unwrap_or_default() {
+    let panes = snap.map(|s| s.panes.as_slice()).unwrap_or_default();
+    for p in panes {
         let Some(r) = &p.rec else { continue };
         let mut level = Level::Ok;
-        let owner = if r.pid == 0 {
-            "no owner pid".to_owned()
-        } else if owner::alive(r.pid, &r.start) {
-            format!("owner {} alive", r.pid)
-        } else {
-            level = Level::Warn;
-            format!("owner {} dead (stale)", r.pid)
-        };
+        let owner = owner_text(r, &mut level);
         let proto = match r.proto.as_str() {
             PROTO => format!("proto {PROTO}"),
             "" => {
@@ -828,15 +852,42 @@ fn pane_checks(snap: Option<&Snapshot>, now: u64) -> Vec<Check> {
         } else {
             ""
         };
+        let attached = if r.attached.is_empty() {
+            String::new()
+        } else {
+            format!(", attached to background session {}", r.attached)
+        };
         out.push(check(
             level,
             format!(
-                "pane {} {}:{}.{} {}, {owner}, plugin {plugin}, {proto}, {age} in state{dead}",
+                "pane {} {}:{}.{} {}, {owner}, plugin {plugin}, {proto}, {age} in state{dead}{attached}",
                 p.id,
                 p.session_name,
                 p.window_index,
                 p.pane_index,
                 r.st.display()
+            ),
+        ));
+    }
+    for b in snap.map(|s| s.bg.as_slice()).unwrap_or_default() {
+        let mut level = Level::Ok;
+        let owner = owner_text(&b.rec, &mut level);
+        let id = attach::short(&b.id);
+        let shown: Vec<&str> = panes
+            .iter()
+            .filter(|p| p.rec.as_ref().is_some_and(|r| r.attached == id))
+            .map(|p| p.id.as_str())
+            .collect();
+        let shown = if shown.is_empty() {
+            "not attached in any pane".to_owned()
+        } else {
+            format!("attached in {}", shown.join(" "))
+        };
+        out.push(check(
+            level,
+            format!(
+                "background session {id} {}, {owner}, {shown}",
+                b.rec.st.display()
             ),
         ));
     }
@@ -1295,6 +1346,7 @@ mod tests {
             id: id.into(),
             window: window.into(),
             dead: false,
+            pid: 0,
             session_name: "main".into(),
             window_index: "1".into(),
             pane_index: "0".into(),
@@ -1321,6 +1373,9 @@ mod tests {
             global: Global::default(),
             clients: Vec::new(),
             panes,
+            bg: Vec::new(),
+            bg_orig: Vec::new(),
+            bg_restored: false,
         }
     }
 
@@ -1342,6 +1397,7 @@ mod tests {
             since: 100,
             proto: PROTO.into(),
             plugin: "0.1.0".into(),
+            attached: String::new(),
         }
     }
 
@@ -1374,6 +1430,37 @@ mod tests {
         let c = pane_checks(Some(&s), 142);
         assert_eq!(c[0].level, Level::Warn);
         assert!(c[0].msg.ends_with(", pane dead (stale)"), "{}", c[0].msg);
+    }
+
+    #[test]
+    fn background_session_lines() {
+        let mut s = snap_with(Some(Rec {
+            attached: "686fd2bf".into(),
+            ..live_rec()
+        }));
+        s.bg.push(Bg {
+            id: "686fd2bf-cb86".into(),
+            rec: live_rec(),
+        });
+        let pid = std::process::id();
+        let c = pane_checks(Some(&s), 142);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert!(
+            c[0].msg
+                .ends_with(", attached to background session 686fd2bf"),
+            "{}",
+            c[0].msg
+        );
+        assert_eq!(c[1].level, Level::Ok);
+        assert_eq!(
+            c[1].msg,
+            format!("background session 686fd2bf needs-input, owner {pid} alive, attached in %3")
+        );
+        s.panes.clear();
+        s.bg[0].rec.pid = 0;
+        let c = pane_checks(Some(&s), 142);
+        assert_eq!(c.len(), 1, "no 'no session' warning: {c:?}");
+        assert!(c[0].msg.ends_with("no owner pid, not attached in any pane"));
     }
 
     #[test]
@@ -1426,6 +1513,12 @@ mod tests {
         assert!(fingerprint(Some(&a)) != fingerprint(Some(&b)));
         let mut b = a.clone();
         b.panes[0].win_icon = "i".into();
+        assert!(fingerprint(Some(&a)) != fingerprint(Some(&b)));
+        let mut b = a.clone();
+        b.bg.push(Bg {
+            id: "x".into(),
+            rec: live_rec(),
+        });
         assert!(fingerprint(Some(&a)) != fingerprint(Some(&b)));
         assert!(fingerprint(Some(&a)) != fingerprint(None));
     }

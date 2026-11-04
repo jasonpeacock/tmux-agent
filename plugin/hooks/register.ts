@@ -17,7 +17,10 @@ const AGENT_LIVE = new Set(['pending', 'running', 'waiting'])
 const DIALOGS = ['elicitation_dialog', 'elicitation_url_dialog', 'agent_needs_input', 'worker_permission_prompt']
 const DIALOGS_DONE = ['elicitation_complete', 'elicitation_response']
 
-type Target = { pane: string; socket: string; pid: string }
+// Where reports go: the pane this session runs in, or, with no pane, a
+// session a background daemon runs and `claude attach` shows in some pane;
+// the binary finds those panes.
+type Target = { pid: string; pane?: { id: string; socket: string } }
 type Ask = { agent: string; tool: string; input: string; timer: { cancel: () => void } }
 
 // The session's state. A reload starts it over; the binary keeps what the
@@ -25,7 +28,7 @@ type Ask = { agent: string; tool: string; input: string; timer: { cancel: () => 
 const s = {
   bin: 'tmux-agent',
   graceMs: 1000,
-  // Settles to the pane to report to, or null when this session has none.
+  // Settles to where to report, or null when this session reports nothing.
   target: Promise.resolve(null) as Promise<Target | null>,
   chain: Promise.resolve() as Promise<unknown>,
   asks: new Map<string, Ask>(),
@@ -134,18 +137,27 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => next(e))
 }
 
-// The pane this interactive session runs in, or null outside tmux.
+// The pane this interactive session runs in. With neither TMUX nor
+// TMUX_PANE, an attached target: a session run by a background daemon has no
+// TMUX, and attaching raises no event, so the binary finds the panes that
+// show it (and ignores engines that no daemon hosts).
 async function findTarget($: EngineInterface): Promise<Target | null> {
   try {
     const tmux = await $.env.get('TMUX')
-    const pane = await $.env.get('TMUX_PANE')
-    const socket = tmux?.match(/^(.*),\d+,\d+$/)?.[1]
-    if (!socket || !pane || !/^%\d+$/.test(pane)) return null
+    const id = await $.env.get('TMUX_PANE')
+    let pane: Target['pane']
+    // Half a tmux environment is neither a pane nor a background session.
+    if (!tmux !== !id) return null
+    if (tmux && id) {
+      const socket = tmux.match(/^(.*),\d+,\d+$/)?.[1]
+      if (!socket || !/^%\d+$/.test(id)) return null
+      pane = { id, socket }
+    }
     // $.process.run is spawned by the engine, so the shell's parent is the
     // Claude process that owns this pane.
     const r = await $.process.run(['sh', '-c', 'echo $PPID'], { timeoutMs: 2000 })
     const pid = r.stdout.trim()
-    return /^\d+$/.test(pid) ? { pane, socket, pid } : null
+    return /^\d+$/.test(pid) ? { pid, pane } : null
   } catch {
     return null
   }
@@ -158,9 +170,10 @@ function report($: EngineInterface, event: string, extra: string[] = []): Promis
     .then(async t => {
       if (!t) return
       const session = await $.session.id().catch(() => '')
+      const where = t.pane ? ['--pane', t.pane.id, '--socket', t.pane.socket] : ['--attached']
       // The event comes first: an older binary skips flags it does not know.
       await $.process.run(
-        [s.bin, 'report', event, '--pane', t.pane, '--socket', t.socket, '--pid', t.pid,
+        [s.bin, 'report', event, ...where, '--pid', t.pid,
           '--session', session, '--proto', PROTO, '--plugin-version', PLUGIN_VERSION, ...extra],
         { timeoutMs: 2000 },
       )

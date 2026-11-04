@@ -46,12 +46,40 @@ test('a turn reports claim, working, then done with its pane and pid', async ($,
 
   expect(w.events()).toEqual(['claim', 'working', 'done'])
   expect(w.reports[0]).toEqual(expect.arrayContaining(['--pane', '%3', '--socket', '/tmp/tmux-1/default', '--pid', '4242', '--session', 'sid-1', '--proto', '1']))
+  expect(w.reports[0]).not.toContain('--attached')
   expect(w.reports[2]).toEqual(expect.arrayContaining(['--bg', '0']))
 })
 
-test('outside tmux nothing is reported', async ($, on) => {
+test('outside tmux an interactive session reports as attached, with no pane', async ($, on) => {
   const w = world(on, {})
   await $.session.start(START)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await $.turn.complete(done('answer'))
+  await w.clock.advance(0)
+  expect(w.events()).toEqual(['claim', 'working', 'done'])
+  for (const r of w.reports) {
+    expect(r[2]).not.toBe('--attached')
+    expect(r).toEqual(expect.arrayContaining(['--attached', '--pid', '4242', '--session', 'sid-1', '--proto', '1']))
+    expect(r).not.toContain('--pane')
+    expect(r).not.toContain('--socket')
+  }
+  expect(w.reports[2]).toEqual(expect.arrayContaining(['--bg', '0']))
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 'sid-1', resume: undefined as never })
+  expect(w.events().at(-1)).toBe('release')
+})
+
+test('outside tmux a non-interactive session (claude -p) reports nothing', async ($, on) => {
+  const w = world(on, {})
+  await $.session.start({ ...START, isInteractive: false })
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await w.clock.advance(0)
+  expect(w.reports).toEqual([])
+})
+
+test('outside tmux a non-terminal surface reports nothing', async ($, on) => {
+  const w = world(on, {})
+  await $.session.start({ ...START, surface: null, isInteractive: false })
   await $.turn.start({ text: 'hi', turnId: 't1' })
   await w.clock.advance(0)
   expect(w.reports).toEqual([])
@@ -60,6 +88,24 @@ test('outside tmux nothing is reported', async ($, on) => {
 test('a non-interactive session (claude -p) reports nothing', async ($, on) => {
   const w = world(on)
   await $.session.start({ ...START, isInteractive: false })
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await w.clock.advance(0)
+  expect(w.reports).toEqual([])
+})
+
+for (const env of [{ TMUX: '/tmp/tmux-1/default,1,0' }, { TMUX_PANE: '%3' }]) {
+  test(`half a tmux environment (${Object.keys(env)[0]} alone) reports nothing`, async ($, on) => {
+    const w = world(on, env)
+    await $.session.start(START)
+    await $.turn.start({ text: 'hi', turnId: 't1' })
+    await w.clock.advance(0)
+    expect(w.reports).toEqual([])
+  })
+}
+
+test('a malformed TMUX reports nothing', async ($, on) => {
+  const w = world(on, { TMUX: 'garbage', TMUX_PANE: '%3' })
+  await $.session.start(START)
   await $.turn.start({ text: 'hi', turnId: 't1' })
   await w.clock.advance(0)
   expect(w.reports).toEqual([])

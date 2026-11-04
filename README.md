@@ -14,6 +14,7 @@ Idle shows nothing. A pane counts as seen once you focus it.
 
 - A Claude Code plugin (`plugin/`) listens to Claude's in-process plugin API: turn start and end (including Esc cancels), permission prompts, questions, plan approval, and background work. It reports each change to the `tmux-agent` binary.
 - The `tmux-agent` binary (Rust) keeps the state in tmux options. It rolls the panes of each window up into `@agent_tab_color` and `@agent_tab_icon`, which your theme reads when it renders. It also colours pane borders, publishes a status-right summary, and provides a jump key, an agent menu and `prefix w` badges.
+- A session that Claude runs in a background daemon shows on every pane that runs `claude attach <id>` for it; tmux-agent finds those panes from the process table on each status refresh, and keeps its state across a tmux restart.
 
 ## Install
 

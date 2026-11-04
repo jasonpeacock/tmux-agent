@@ -49,12 +49,27 @@ pub struct Rec {
     pub since: u64,
     pub proto: String,
     pub plugin: String,
+    /// On a pane: the short id of the background session it shows through
+    /// `claude attach`, or empty for a session that runs in the pane.
+    pub attached: String,
+}
+
+/// A background session's record, kept server-wide in `@agent_bg` because
+/// it has no pane of its own. See docs/design.md, "Background sessions".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bg {
+    /// The session id from the engine's `--session-id`.
+    pub id: String,
+    pub rec: Rec,
 }
 
 #[derive(Clone, Debug)]
 pub struct Pane {
     pub id: String,
     pub window: String,
+    /// The pane's first process, where an ancestry walk from `claude attach`
+    /// ends.
+    pub pid: u32,
     pub dead: bool,
     pub session_name: String,
     pub window_index: String,
@@ -77,13 +92,20 @@ pub struct Snapshot {
     pub clients: Vec<Client>,
     /// One entry per pane, in server order, linked windows deduplicated.
     pub panes: Vec<Pane>,
+    /// Background session records: what `@agent_bg` holds now, and what it
+    /// will hold after `sync`.
+    pub bg_orig: Vec<Bg>,
+    pub bg: Vec<Bg>,
+    /// `bg` came from the copy on disk after a server restart, so
+    /// `@agent_bg` must be written even if `bg` does not change.
+    pub bg_restored: bool,
 }
 
 const G_FMT: &str = concat!(
     "\t#{@tmux-agent-bin}\t#{@tmux-agent-tab-mode}\t#{@tmux-agent-pane-border}",
     "\t#{@tmux-agent-icon-needs-input}\t#{@tmux-agent-icon-done}\t#{@tmux-agent-icon-working}",
     "\t#{E:@tmux-agent-color-needs-input}\t#{E:@tmux-agent-color-done}\t#{E:@tmux-agent-color-working}",
-    "\t#{version}\t#{@agent_summary}\t#{@tmux-agent-summary-style}",
+    "\t#{version}\t#{@agent_summary}\t#{@tmux-agent-summary-style}\t#{@agent_bg}",
 );
 const C_FMT: &str =
     "\t#{client_name}\t#{pane_id}\t#{client_flags}\t#{client_height}\t#{client_width}";
@@ -92,7 +114,7 @@ const P_FMT: &str = concat!(
     "\t#{pane_id}\t#{window_id}\t#{pane_dead}\t#{window_index}\t#{pane_index}",
     "\t#{@agent_pane_loop}\t#{@agent_pane_asks}\t#{@agent_pane_bg}",
     "\t#{@agent_pane_pid}\t#{@agent_pane_pid_start}\t#{@agent_pane_since}\t#{@agent_pane_session}",
-    "\t#{@agent_pane_proto}\t#{@agent_pane_plugin}",
+    "\t#{@agent_pane_proto}\t#{@agent_pane_plugin}\t#{@agent_pane_attached}\t#{pane_pid}",
     "\t#{@agent_window_state}\t#{@agent_tab_color}\t#{@agent_tab_icon}",
     "\t#{session_name}\t#{window_name}\t#{pane_current_path}",
 );
@@ -178,12 +200,14 @@ fn parse(out: &str, tag: &Tag) -> Option<Snapshot> {
     let mut global = Global::default();
     let mut clients = Vec::new();
     let mut panes: Vec<Pane> = Vec::new();
+    let mut bg = Vec::new();
     for line in out.lines() {
         if let Some(rest) = tag.strip('G', line) {
             if config.is_none() {
-                let (c, g) = parse_global(rest);
+                let (c, g, b) = parse_global(rest);
                 config = Some(c);
                 global = g;
+                bg = b;
             }
         } else if let Some(rest) = tag.strip('C', line) {
             clients.extend(parse_client(rest));
@@ -203,6 +227,9 @@ fn parse(out: &str, tag: &Tag) -> Option<Snapshot> {
         global,
         clients,
         panes,
+        bg_orig: bg.clone(),
+        bg,
+        bg_restored: false,
     })
 }
 
@@ -214,8 +241,8 @@ fn or_default(v: &str, d: &str) -> String {
     }
 }
 
-fn parse_global(rest: &str) -> (Config, Global) {
-    let f: Vec<&str> = rest.splitn(12, '\t').collect();
+fn parse_global(rest: &str) -> (Config, Global, Vec<Bg>) {
+    let f: Vec<&str> = rest.splitn(13, '\t').collect();
     let get = |i: usize| f.get(i).copied().unwrap_or("");
     let config = Config {
         bin: get(0).to_owned(),
@@ -230,7 +257,7 @@ fn parse_global(rest: &str) -> (Config, Global) {
         summary: get(10).to_owned(),
         ..Global::default()
     };
-    (config, global)
+    (config, global, parse_bg(get(12)))
 }
 
 fn parse_client(rest: &str) -> Option<Client> {
@@ -248,29 +275,84 @@ fn parse_client(rest: &str) -> Option<Client> {
 }
 
 fn parse_pane(rest: &str) -> Option<Pane> {
-    let f: Vec<&str> = rest.splitn(20, '\t').collect();
-    if f.len() < 20 {
+    let f: Vec<&str> = rest.splitn(22, '\t').collect();
+    if f.len() < 22 {
         return None;
     }
-    let rec = parse_rec(&f[5..14]);
+    let rec = parse_rec(&f[5..15]);
     Some(Pane {
         id: f[0].to_owned(),
         window: f[1].to_owned(),
         dead: f[2] == "1",
         window_index: f[3].to_owned(),
         pane_index: f[4].to_owned(),
+        pid: f[15].parse().unwrap_or(0),
         orig: rec.clone(),
         rec,
-        win_state: f[14].to_owned(),
-        win_color: f[15].to_owned(),
-        win_icon: f[16].to_owned(),
-        session_name: f[17].to_owned(),
-        window_name: f[18].to_owned(),
-        path: f[19].to_owned(),
+        win_state: f[16].to_owned(),
+        win_color: f[17].to_owned(),
+        win_icon: f[18].to_owned(),
+        session_name: f[19].to_owned(),
+        window_name: f[20].to_owned(),
+        path: f[21].to_owned(),
     })
 }
 
-/// loop, asks, bg, pid, pid_start, since, session, proto, plugin.
+/// Separates the records in `@agent_bg`, and the fields in a record. tmux
+/// stores the value as given; neither character occurs in a field.
+const BG_SEP: &str = " ";
+const BG_FIELD_SEP: &str = "|";
+
+/// `@agent_bg`: records of id, loop, asks, bg, pid, pid_start, since,
+/// session, proto, plugin. A malformed record is dropped.
+pub fn parse_bg(v: &str) -> Vec<Bg> {
+    let mut out: Vec<Bg> = Vec::new();
+    for r in v.split(BG_SEP).filter(|r| !r.is_empty()) {
+        let f: Vec<&str> = r.split(BG_FIELD_SEP).collect();
+        if f.len() != 10 || f[0].is_empty() || out.iter().any(|b| b.id == f[0]) {
+            continue;
+        }
+        let mut fields = f[1..].to_vec();
+        fields.push("");
+        if let Some(rec) = parse_rec(&fields) {
+            out.push(Bg {
+                id: f[0].to_owned(),
+                rec,
+            });
+        }
+    }
+    out
+}
+
+/// The `@agent_bg` value for `bg`, empty when there are none.
+pub fn format_bg(bg: &[Bg]) -> String {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !BG_SEP.contains(*c) && !BG_FIELD_SEP.contains(*c) && !c.is_control())
+            .collect()
+    };
+    bg.iter()
+        .map(|b| {
+            let r = &b.rec;
+            [
+                clean(&b.id),
+                r.st.lp.as_str().to_owned(),
+                u8::from(r.st.asks).to_string(),
+                r.st.bg.to_string(),
+                r.pid.to_string(),
+                clean(&r.start),
+                r.since.to_string(),
+                clean(&r.session),
+                clean(&r.proto),
+                clean(&r.plugin),
+            ]
+            .join(BG_FIELD_SEP)
+        })
+        .collect::<Vec<_>>()
+        .join(BG_SEP)
+}
+
+/// loop, asks, bg, pid, pid_start, since, session, proto, plugin, attached.
 fn parse_rec(f: &[&str]) -> Option<Rec> {
     let lp = Loop::parse(f[0])?;
     Some(Rec {
@@ -285,6 +367,7 @@ fn parse_rec(f: &[&str]) -> Option<Rec> {
         session: f[6].to_owned(),
         proto: f[7].to_owned(),
         plugin: f[8].to_owned(),
+        attached: f[9].to_owned(),
     })
 }
 
@@ -293,13 +376,13 @@ mod tests {
     use super::*;
 
     const OUT: &str = "\
-Gt\t/bin/ta\t\toff\t\t\tW\t#ff0000\t\t\t3.8\tS\tdots
+Gt\t/bin/ta\t\toff\t\t\tW\t#ff0000\t\t\t3.8\tS\tdots\t686fd2bf-cb86|done|0|0|42|1.5|100|sid|1|0.1.0 bad|x
 Gt\tignored
 Ct\t/dev/ttys001\t%1\tattached,focused,UTF-8\t50\t120
 Ct\t/dev/ttys002\t%2\tattached\t40\t80
-Pt\t%1\t@1\t0\t1\t1\tdone\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\tdone\t#a6e3a1\t \tmain\tzsh\t/home/u
-Pt\t%2\t@1\t0\t1\t2\t\t\t\t\t\t\t\t\t\tdone\t#a6e3a1\t \tmain\tvim\t/a\tb
-Pt\t%1\t@1\t0\t1\t1\tdone\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\tdone\t#a6e3a1\t \tgrouped\tzsh\t/home/u
+Pt\t%1\t@1\t0\t1\t1\tdone\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\t686fd2bf\t77\tdone\t#a6e3a1\t \tmain\tzsh\t/home/u
+Pt\t%2\t@1\t0\t1\t2\t\t\t\t\t\t\t\t\t\t\t78\tdone\t#a6e3a1\t \tmain\tvim\t/a\tb
+Pt\t%1\t@1\t0\t1\t1\tdone\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\t686fd2bf\t77\tdone\t#a6e3a1\t \tgrouped\tzsh\t/home/u
 default
 underscore
 ";
@@ -348,7 +431,20 @@ underscore
         );
         assert_eq!((r.pid, r.start.as_str(), r.since), (42, "1.5", 100));
         assert_eq!(p.win_state, "done");
+        assert_eq!((p.pid, r.attached.as_str()), (77, "686fd2bf"));
         assert!(s.panes[1].rec.is_none());
+        assert_eq!(s.panes[1].pid, 78);
+
+        assert_eq!(s.bg.len(), 1, "the malformed record is dropped");
+        assert_eq!(s.bg, s.bg_orig);
+        assert_eq!(s.bg[0].id, "686fd2bf-cb86");
+        assert_eq!(
+            s.bg[0].rec,
+            Rec {
+                attached: String::new(),
+                ..r.clone()
+            }
+        );
         assert_eq!(s.panes[1].path, "/a\tb");
     }
 
@@ -358,7 +454,7 @@ underscore
         // carry this call's tag, so all are dropped.
         let out = "\
 Gt\t\t\t\t\t\t\t\t\t\t3.8\t
-Pt\t%1\t@1\t0\t1\t1\tworking\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\tworking\t#f\tW \tmain\tzsh\t/x
+Pt\t%1\t@1\t0\t1\t1\tworking\t0\t0\t42\t1.5\t100\tsid\t1\t0.1.0\t\t77\tworking\t#f\tW \tmain\tzsh\t/x
 C\tfake\t%1\tfocused\t40\t80
 Cu\tfake\t%1\tfocused\t40\t80
 fg=blue
@@ -369,6 +465,29 @@ bold
         assert_eq!(s.panes.len(), 1);
         assert_eq!(s.global.status_style, "fg=blue");
         assert_eq!(s.global.status_current_style, "bold");
+    }
+
+    #[test]
+    fn bg_records_round_trip() {
+        let v = "a1b2c3d4-x|working|1|2|42||7|sid|1|0.1.0 e5f6a7b8|done|0|0|43|9.1|8|||";
+        let bg = parse_bg(v);
+        assert_eq!(bg.len(), 2);
+        assert_eq!(bg[0].rec.st.bg, 2);
+        assert!(bg[0].rec.st.asks);
+        assert_eq!(bg[1].rec.plugin, "");
+        assert_eq!(format_bg(&bg), v);
+        assert_eq!(format_bg(&[]), "");
+        assert!(parse_bg("").is_empty());
+        // A duplicate id and a bad loop are dropped.
+        assert_eq!(
+            parse_bg(&format!("{v} a1b2c3d4-x|done|0|0|1||1|||")).len(),
+            2
+        );
+        assert!(parse_bg("x|nope|0|0|1||1|||").is_empty());
+        // Separators and control characters cannot leak out of a field.
+        let mut b = bg[0].clone();
+        b.rec.session = "a b|c\td".into();
+        assert_eq!(parse_bg(&format_bg(&[b]))[0].rec.session, "abcd");
     }
 
     #[test]

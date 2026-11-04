@@ -26,6 +26,9 @@ struct Agent {
     state: Display,
     since: u64,
     bg: u32,
+    /// The short id of the background session the pane shows through
+    /// `claude attach`, or empty.
+    attached: String,
 }
 
 /// Moves `client` to the most urgent agent pane, cycling on repeat.
@@ -131,6 +134,7 @@ fn agents(snap: &Snapshot) -> Vec<Agent> {
                 state: r.st.display(),
                 since: r.since,
                 bg: r.st.bg,
+                attached: r.attached.clone(),
             })
         })
         .collect();
@@ -422,18 +426,24 @@ fn age(secs: u64) -> String {
     }
 }
 
-/// pane_id, target, state, seconds in state, bg, window name, cwd.
+/// pane_id, target, state, seconds in state, bg, attached session (`-`
+/// for none), window name, cwd.
 fn to_lines(agents: &[Agent], now: u64) -> String {
     agents
         .iter()
         .map(|a| {
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 a.id,
                 a.target,
                 a.state,
                 now.saturating_sub(a.since),
                 a.bg,
+                if a.attached.is_empty() {
+                    "-"
+                } else {
+                    &a.attached
+                },
                 a.window,
                 a.path
             )
@@ -448,13 +458,18 @@ fn to_json(agents: &[Agent], now: u64) -> String {
             format!(
                 concat!(
                     r#"{{"pane_id":{},"target":{},"state":{},"seconds":{},"bg":{},"#,
-                    r#""window":{},"cwd":{}}}"#
+                    r#""attached":{},"window":{},"cwd":{}}}"#
                 ),
                 json_str(&a.id),
                 json_str(&a.target),
                 json_str(a.state.as_str()),
                 now.saturating_sub(a.since),
                 a.bg,
+                if a.attached.is_empty() {
+                    "null".to_owned()
+                } else {
+                    json_str(&a.attached)
+                },
                 json_str(&a.window),
                 json_str(&a.path),
             )
@@ -501,6 +516,7 @@ mod tests {
             state,
             since,
             bg: 0,
+            attached: String::new(),
         }
     }
 
@@ -773,8 +789,13 @@ mod tests {
         let mut a = agent("%1", Working, 90);
         a.bg = 2;
         assert_eq!(
+            to_lines(&[a.clone()], 100),
+            "%1\ts:1.1\tworking\t10\t2\t-\tzsh\t/tmp\n"
+        );
+        a.attached = "686fd2bf".into();
+        assert_eq!(
             to_lines(&[a], 100),
-            "%1\ts:1.1\tworking\t10\t2\tzsh\t/tmp\n"
+            "%1\ts:1.1\tworking\t10\t2\t686fd2bf\tzsh\t/tmp\n"
         );
         assert_eq!(to_lines(&[], 100), "");
     }
@@ -786,9 +807,14 @@ mod tests {
         a.path = "/x\ny\t\u{1}\u{7f}é".into();
         let one = concat!(
             r#"{"pane_id":"%1","target":"s:1.1","state":"needs-input","seconds":3,"bg":0,"#,
-            r#""window":"q\"b\\s","cwd":"/x\ny\t\u0001\u007fé"}"#,
+            r#""attached":null,"window":"q\"b\\s","cwd":"/x\ny\t\u0001\u007fé"}"#,
         );
-        assert_eq!(to_json(&[a.clone(), a], 103), format!("[{one},{one}]\n"));
+        assert_eq!(
+            to_json(&[a.clone(), a.clone()], 103),
+            format!("[{one},{one}]\n")
+        );
+        a.attached = "686fd2bf".into();
+        assert!(to_json(&[a], 103).contains(r#""bg":0,"attached":"686fd2bf","window""#));
         assert_eq!(to_json(&[], 0), "[]\n");
     }
 }
