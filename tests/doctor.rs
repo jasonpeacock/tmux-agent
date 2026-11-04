@@ -308,11 +308,7 @@ fn theme_and_status_through_option_references_pass() {
         "{stdout}"
     );
     assert!(
-        line(
-            &stdout,
-            "window formats read @agent_tab_color and @agent_tab_icon"
-        )
-        .starts_with("ok "),
+        line(&stdout, "window formats read @agent_tab_color").starts_with("ok "),
         "{stdout}"
     );
 }

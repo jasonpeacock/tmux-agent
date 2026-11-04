@@ -672,12 +672,13 @@ fn agent_version_check(v: &str) -> Check {
 
 fn theme_check(s: &Server) -> Check {
     const FORMATS: [&str; 2] = ["window-status-format", "window-status-current-format"];
-    // In style mode the binary sets the colour itself.
-    let opts: &[&str] = if s.style_mode {
-        &["@agent_tab_icon"]
-    } else {
-        &["@agent_tab_color", "@agent_tab_icon"]
-    };
+    // In style mode the binary sets the tab's style itself. Otherwise the
+    // formats must read the colour; the icon is optional, e.g. for a theme
+    // that marks state with a coloured dot.
+    if s.style_mode {
+        return check(Level::Ok, "tab mode style: tmux-agent sets the tab colour");
+    }
+    let opts: &[&str] = &["@agent_tab_color"];
     let m = s.windows.len();
     let mut gaps = Vec::new();
     let mut none = true;
@@ -720,8 +721,9 @@ fn theme_check(s: &Server) -> Check {
         gaps = vec![format!("no window format reads {}", opts.join(" or "))];
     }
     check(Level::Warn, gaps.join("; ")).hint(
-        "make both formats read #{@agent_tab_color} and #{@agent_tab_icon} \
-         (README, \"Tab colour and icon\"), or set @tmux-agent-tab-mode style",
+        "make both formats read #{@agent_tab_color}, and #{@agent_tab_icon} if \
+         you want the icon (README, \"Theme integration\"), or set \
+         @tmux-agent-tab-mode style",
     )
 }
 
@@ -1181,24 +1183,22 @@ mod tests {
     const BOTH: &str = "#{@agent_tab_color}#{@agent_tab_icon}";
 
     #[test]
-    fn theme_needs_both_formats_and_both_options() {
+    fn theme_needs_the_colour_in_both_formats() {
         let mut s = Server {
             windows: vec![win(BOTH, BOTH), win(BOTH, BOTH)],
             ..Server::default()
         };
         assert_eq!(theme_check(&s).level, Level::Ok);
-        s.windows[1] = win("", BOTH);
+        // The icon is optional: a coloured dot reads only the colour.
+        let dot = "#W#{?#{@agent_tab_color}, #[fg=#{@agent_tab_color}]x,}";
+        s.windows = vec![win(dot, dot), win(dot, dot)];
+        assert_eq!(theme_check(&s).level, Level::Ok);
+        s.windows[1] = win("", dot);
         let c = theme_check(&s);
         assert_eq!(c.level, Level::Warn);
         assert_eq!(
             c.msg,
-            "window-status-format lacks @agent_tab_color and @agent_tab_icon in 1 of 2 windows"
-        );
-        s.windows[0] = win("#{@agent_tab_icon}", BOTH);
-        assert_eq!(
-            theme_check(&s).msg,
-            "window-status-format lacks @agent_tab_color in 2 of 2 windows; \
-             window-status-format lacks @agent_tab_icon in 1 of 2 windows"
+            "window-status-format lacks @agent_tab_color in 1 of 2 windows"
         );
         // Only the current window themed: the other tabs show nothing.
         s.windows = vec![win("#W", BOTH)];
@@ -1207,22 +1207,14 @@ mod tests {
         assert!(!c.msg.contains("current"), "{}", c.msg);
         // An icon alone does not colour the tab.
         s.windows = vec![win("#{@agent_tab_icon}", "#{@agent_tab_icon}")];
-        let c = theme_check(&s);
-        assert_eq!(c.level, Level::Warn);
-        assert!(!c.msg.contains("_icon"), "{}", c.msg);
-        // In style mode the binary sets the colour; the icon still needs the format.
+        assert_eq!(
+            theme_check(&s).msg,
+            "no window format reads @agent_tab_color"
+        );
+        // In style mode the binary sets the colour; nothing is required.
         s.style_mode = true;
-        assert_eq!(theme_check(&s).level, Level::Ok);
         s.windows = vec![win("#W", "#W")];
-        assert_eq!(
-            theme_check(&s).msg,
-            "no window format reads @agent_tab_icon"
-        );
-        s.style_mode = false;
-        assert_eq!(
-            theme_check(&s).msg,
-            "no window format reads @agent_tab_color or @agent_tab_icon"
-        );
+        assert_eq!(theme_check(&s).level, Level::Ok);
     }
 
     #[test]
