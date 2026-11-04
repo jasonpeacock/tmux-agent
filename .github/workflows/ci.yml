@@ -38,9 +38,6 @@ jobs:
 
   claude-plugin:
     runs-on: ubuntu-latest
-    # Until it is known that the public build validates mods without a login
-    # (docs/design.md, V-5).
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - run: npm install -g @anthropic-ai/claude-code

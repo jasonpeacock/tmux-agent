@@ -305,16 +305,20 @@ flowchart TB
 
 The binary publishes `@agent_tab_color` and `@agent_tab_icon` per window. There are two modes, set by `@tmux-agent-tab-mode`:
 
-- **`options`** (default). The binary only publishes, and the theme reads the options. For catppuccin, which bakes inline colours into its formats, replace your existing catppuccin window lines with these, before catppuccin loads:
+- **`options`** (default). The binary only publishes, and the theme reads the options. Only `@agent_tab_color` is required; the icon is optional. For catppuccin, the recommended form puts a dot in the state colour after the window name. The theme's own tab colours stay untouched, so the active tab remains recognisable. Set these before catppuccin loads:
 
   ```tmux
-  set -g @catppuccin_window_number_color         "#{?#{@agent_tab_color},#{@agent_tab_color},#{@thm_overlay_2}}"
-  set -g @catppuccin_window_current_number_color "#{?#{@agent_tab_color},#{@agent_tab_color},#{@thm_mauve}}"
-  set -g @catppuccin_window_text         "  #{@agent_tab_icon}#W"
-  set -g @catppuccin_window_current_text "  #{@agent_tab_icon}#W"
+  set -g @catppuccin_window_text         "  #W#{?#{@agent_tab_color}, #[fg=#{@agent_tab_color}]●#[fg=#{@thm_fg}],}"
+  set -g @catppuccin_window_current_text "  #W#{?#{@agent_tab_color}, #[fg=#{@agent_tab_color}]●#[fg=#{@thm_fg}],}"
   ```
 
-  Verified on tmux 3.8 with catppuccin 2.1.3: the number block of an agent window takes the state colour, and other windows keep the theme colour. The load order of tmux-agent against catppuccin does not matter.
+  Verified on tmux 3.8 with catppuccin 2.1.3. The load order of tmux-agent against catppuccin does not matter.
+
+  Two alternatives were tried and set aside:
+  - Recolouring the number block (`@catppuccin_window_number_color` / `_current_number_color` set to `#{?#{@agent_tab_color},…}`). The active tab then loses its mauve, so it cannot be told apart from another tab in the same state.
+  - A coloured icon on inactive tabs with a coloured name background on the active tab. The Nerd Font icons proved hard to recognise at tab size.
+
+  Options removed from tmux.conf stay set in a running server across a reload, and catppuccin's `set -ogq` defaults do not replace them. Unset them (`tmux set -gu …`) when changing styles.
 
 - **`style`**. For themes without inline colours, the binary also sets a per-window `window-status-style` and `window-status-current-style`. The value is the global style plus `,bg=<colour>`, so the user's fg and attributes survive. Both are unset with `-wu` when the window has no state.
 
@@ -523,7 +527,7 @@ Dependencies: `libc` and `lexopt`. `list --json` output is written by hand.
 - **CI** (GitHub Actions):
   - Rust job on `ubuntu-latest` and `macos-latest`: fmt, clippy `-D warnings` and test. One Ubuntu job pins tmux 3.3a to hold the floor.
   - Nix job: `nix flake check -L` on both.
-  - Plugin job: `claude plugin validate` and `plugin test`, with `continue-on-error` until V-5 is resolved.
+  - Plugin job: `claude plugin validate` and `plugin test`, with the public npm build.
 
 ## Verified
 
@@ -540,13 +544,17 @@ Dependencies: `libc` and `lexopt`. `list --json` output is written by hand.
 - **No approval signal** (was V-1): order of events for an approved Bash call: `tool.call` start, `tool.check` → `ask` (15 ms), `classic.PermissionRequest` (its `next` resolves at once), then nothing until `classic.PostToolUse` when the tool ends.
 - **Do not run processes from `tool.check` or `tool.call` hooks:** a `$.process.run` awaited inside them stalled the turn.
 
+- **Key ownership on tmux 3.3** (was V-4): `list-keys -F` arrived in tmux 3.7; 3.3a's `list-keys` takes only `-1aNP:T:`. Ownership uses per-key `list-keys -N` queries (see Navigation).
+- **Plugin checks in CI** (was V-5): the public npm `@anthropic-ai/claude-code` runs `claude plugin validate` and `claude plugin test` on GitHub's runners with no login.
+- **Background sessions** (`claude attach`): live on macOS with Claude 2.1.316. The engine under `--bg-pty-host` reports as an interactive terminal session with no tmux environment, and the attached pane shows its state.
+- **Linux:** `doctor` passes and sessions report on the Linux desktop (tmux 3.8, Claude 2.1.316).
+- **tmux 3.3a, 3.4, 3.5a, 3.6a and 3.8:** the full test suite passes on each.
+
 ## To verify
 
 | # | Question | Why it matters |
 |---|---|---|
 | V-2 | Which events fire when the user rejects a dialog with "No, and tell Claude…"? | The ask must close. |
 | V-3 | Does a finished background subagent wake the main thread? | If yes, drop the agent-turn fallback. |
-| V-4 | Answered: no. `list-keys -F` arrived in tmux 3.7; 3.3a's `list-keys` takes only `-1aNP:T:`. Ownership uses `list-keys -N` (see Navigation). | Key ownership detection, or a higher tmux floor. |
-| V-5 | Can public npm `@anthropic-ai/claude-code` run `plugin validate` and `plugin test` in CI with no login? | The plugin CI job. |
 | V-6 | Does `pane-focus-in` fire over SSH from WezTerm? | Seen on terminal focus. |
 | V-8 | Does `Notification` (elicitation types) reach the mod live? `PermissionRequest` does (Verified). | Elicitation asks. |
