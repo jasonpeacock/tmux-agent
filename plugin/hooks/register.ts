@@ -34,6 +34,10 @@ const s = {
   asks: new Map<string, Ask>(),
   askShown: false,
   bg: 0,
+  // True when all of bg is background subagents. Shells and workflows wake
+  // the main thread when they finish, and that turn reports done; only
+  // subagents may need the agent-turn fallback.
+  bgOnlyAgents: false,
   mainRunning: false,
 }
 
@@ -62,7 +66,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', ($, e, next) => {
     if (e.agentId) {
       closeAgent($, e.agentId)
-      if (!s.mainRunning && s.bg > 0) checkBackground($)
+      if (!s.mainRunning && s.bg > 0 && s.bgOnlyAgents) checkBackground($)
     } else {
       s.mainRunning = false
       turnEnded($, e.reason)
@@ -131,7 +135,9 @@ export const register: Register = (on, options) => {
 
   on('classic.Stop', ($, e, next) => {
     if (e.agent_id === undefined) {
-      s.bg = (e.background_tasks ?? []).filter(t => BG_TYPES.has(t.type) && BG_LIVE.has(t.status)).length
+      const live = (e.background_tasks ?? []).filter(t => BG_TYPES.has(t.type) && BG_LIVE.has(t.status))
+      s.bg = live.length
+      s.bgOnlyAgents = live.every(t => t.type === 'subagent')
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -208,7 +214,7 @@ function checkBackground($: EngineInterface) {
       .list()
       .then(list => {
         const live = list.some(a => AGENT_LIVE.has(a.status) && !('teammateId' in a && a.teammateId))
-        if (!live && !s.mainRunning && s.bg > 0) {
+        if (!live && !s.mainRunning && s.bg > 0 && s.bgOnlyAgents) {
           s.bg = 0
           report($, 'done')
         }

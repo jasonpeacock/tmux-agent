@@ -22,6 +22,8 @@ function world(on: On, env: Record<string, string> = TMUX_ENV) {
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   on('tool.call', () => ({ result: {} }))
+  // No agent is listed as running: the background fallback would report done.
+  on('agent.list', () => ({ value: [] }))
   // Classic hook events: no settings hook beneath decides anything.
   on('classic.PermissionRequest', () => ({}))
   on('classic.PostToolUse', () => ({}))
@@ -234,4 +236,37 @@ test('/clear resets the pane and exit releases it', async ($, on) => {
 
   await $.session.end({ reason: 'prompt_input_exit', sessionId: 'sid-1', resume: undefined as never })
   expect(w.events().at(-1)).toBe('release')
+})
+
+test('a workflow agent finishing does not end the workflow early', async ($, on) => {
+  const w = world(on)
+  await $.session.start(START)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await $.classic.Stop({
+    stop_hook_active: false,
+    background_tasks: [{ id: 'w1', type: 'workflow', status: 'running', description: 'review' }],
+  })
+  await $.turn.complete(done('answer'))
+  await w.clock.advance(0)
+  expect(w.reports.at(-1)).toEqual(expect.arrayContaining(['done', '--bg', '1']))
+
+  // One of the workflow's agents ends its turn while the workflow runs on.
+  await $.turn.complete(done('answer', 'wf-agent-1'))
+  await w.clock.advance(1000)
+  expect(w.reports.at(-1)).toEqual(expect.arrayContaining(['done', '--bg', '1']))
+})
+
+test('background subagents with no wake still end in done', async ($, on) => {
+  const w = world(on)
+  await $.session.start(START)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await $.classic.Stop({
+    stop_hook_active: false,
+    background_tasks: [{ id: 'a1', type: 'subagent', status: 'running', description: 'research' }],
+  })
+  await $.turn.complete(done('answer'))
+  await $.turn.complete(done('answer', 'a1'))
+  await w.clock.advance(1000)
+  expect(w.reports.at(-1)?.slice(2, 3)).toEqual(['done'])
+  expect(w.reports.at(-1)).not.toContain('--bg')
 })

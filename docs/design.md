@@ -172,7 +172,7 @@ These rules follow from the events Claude sends:
 | Kind | Handling |
 |---|---|
 | Foreground subagents (Task tool) | Roll into the parent pane. Their prompts open asks. Their turn ends only close their own asks. |
-| Background subagents, workflows, background Bash | Counted from `Stop.background_tasks`. The main turn's end then shows `working`. When the work finishes, Claude wakes the main thread, verified for Bash, and that turn's end reports `done`. The agent-turn fallback covers the case where no wake happens. |
+| Background subagents, workflows, background Bash | Counted from `Stop.background_tasks`. The main turn's end then shows `working`. When the work finishes, Claude wakes the main thread (verified for Bash and workflows), and that turn's end reports `done`. The agent-turn fallback runs only when all the background work is subagents. A workflow's own agents end their turns while the workflow runs on, and `$.agent.list()` does not list them, so a fallback on their turns ended a running workflow early (seen live). |
 | `claude -p` in a pane | Ignored: `isInteractive` is false. |
 | A nested interactive `claude` in a pane already owned | Its `claim` is refused while the owner lives (see Ownership). |
 | A background session (Claude's daemon) viewed with `claude attach` in a pane | Reported `--attached`. Shown on each pane that runs `claude attach` for it (see Background sessions). |
