@@ -143,14 +143,25 @@ claude plugin install tmux-agent --marketplace jasonpeacock/tmux-agent
 
 tmux-agent publishes each window's state colour as `@agent_tab_color`, and an icon as `@agent_tab_icon`, for your theme to read. It never rewrites your theme's formats.
 
-For catppuccin, a coloured dot after the window name leaves the theme's own tab colours alone, so the active tab stays recognisable. Set these in catppuccin's config, before it loads:
+For catppuccin, choose one of two forms. Set its options in catppuccin's config, before it loads.
+
+A coloured dot after the window name leaves the theme's own tab colours alone:
 
 ```tmux
 set -g @catppuccin_window_text         "  #W#{?#{@agent_tab_color}, #[fg=#{@agent_tab_color}]●#[fg=#{@thm_fg}],}"
 set -g @catppuccin_window_current_text "  #W#{?#{@agent_tab_color}, #[fg=#{@agent_tab_color}]●#[fg=#{@thm_fg}],}"
 ```
 
-To follow your catppuccin flavour, set the state colours to its palette, e.g. `programs.tmux-agent.states.needs-input.color = "#{@thm_red}";` (likewise `done` with `@thm_green`, `working` with `@thm_yellow`). To show the icon instead of the dot, put `#{@agent_tab_icon}` before `#W`. For a theme without inline colours, `@tmux-agent-tab-mode style` makes tmux-agent colour the tab itself.
+A coloured background behind the window name is easier to see. The name shows in dark text on the state colour. The number segment keeps the theme's active and inactive colours, so the active tab stays recognisable:
+
+```tmux
+set -g @catppuccin_window_text_color         "#{?#{@agent_tab_color},#{@agent_tab_color},#{@thm_surface_0}}"
+set -g @catppuccin_window_current_text_color "#{?#{@agent_tab_color},#{@agent_tab_color},#{@thm_surface_1}}"
+set -g @catppuccin_window_text               "#{?#{@agent_tab_color},#[fg=#{@thm_crust}],}  #W"
+set -g @catppuccin_window_current_text       "#{?#{@agent_tab_color},#[fg=#{@thm_crust}],}  #W"
+```
+
+To follow your catppuccin flavour, set the state colours to its palette, e.g. `programs.tmux-agent.states.needs-input.color = "#{@thm_red}";` (likewise `done` with `@thm_green`, `working` with `@thm_yellow`). To show the icon in either form, put `#{@agent_tab_icon}` before `#W`, in place of the dot or beside the name. For a theme without inline colours, `@tmux-agent-tab-mode style` makes tmux-agent colour the tab itself.
 
 Add the summary to `status-right` after you set it. Plain:
 

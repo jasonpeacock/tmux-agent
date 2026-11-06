@@ -351,14 +351,23 @@ A linked pane is projected as for a `claude attach` pane, except that the pane o
 
 The binary publishes `@agent_tab_color` and `@agent_tab_icon` per window. There are two modes, set by `@tmux-agent-tab-mode`:
 
-- **`options`** (default). The binary only publishes, and the theme reads the options. Only `@agent_tab_color` is required; the icon is optional. For catppuccin, the recommended form puts a dot in the state colour after the window name. The theme's own tab colours stay untouched, so the active tab remains recognisable. Set these before catppuccin loads:
+- **`options`** (default). The binary only publishes, and the theme reads the options. Only `@agent_tab_color` is required; the icon is optional. For catppuccin there are two forms, set before catppuccin loads. The first puts a dot in the state colour after the window name. The theme's own tab colours stay untouched, so the active tab remains recognisable:
 
   ```tmux
   set -g @catppuccin_window_text         "  #W#{?#{@agent_tab_color}, #[fg=#{@agent_tab_color}]●#[fg=#{@thm_fg}],}"
   set -g @catppuccin_window_current_text "  #W#{?#{@agent_tab_color}, #[fg=#{@agent_tab_color}]●#[fg=#{@thm_fg}],}"
   ```
 
-  Verified on tmux 3.8 with catppuccin 2.1.3. The load order of tmux-agent against catppuccin does not matter.
+  The second, easier to see, gives the name segment the state colour as its background, with dark text, on every tab. The number segment keeps the theme's colours, mauve on the active tab, so the active tab is still told apart from another tab in the same state. catppuccin copies the text colour into `window-status-format` unexpanded (`set -gF` expands one level), so the conditional is evaluated per window when tmux draws the status line, and the rounded end cap takes the same background:
+
+  ```tmux
+  set -g @catppuccin_window_text_color         "#{?#{@agent_tab_color},#{@agent_tab_color},#{@thm_surface_0}}"
+  set -g @catppuccin_window_current_text_color "#{?#{@agent_tab_color},#{@agent_tab_color},#{@thm_surface_1}}"
+  set -g @catppuccin_window_text               "#{?#{@agent_tab_color},#[fg=#{@thm_crust}],}  #W"
+  set -g @catppuccin_window_current_text       "#{?#{@agent_tab_color},#[fg=#{@thm_crust}],}  #W"
+  ```
+
+  Verified on tmux 3.8 with catppuccin 2.1.3: the dot form live, the background form by its expanded tab formats in a private server. The load order of tmux-agent against catppuccin does not matter.
 
   Two alternatives were tried and set aside:
   - Recolouring the number block (`@catppuccin_window_number_color` / `_current_number_color` set to `#{?#{@agent_tab_color},…}`). The active tab then loses its mauve, so it cannot be told apart from another tab in the same state.
